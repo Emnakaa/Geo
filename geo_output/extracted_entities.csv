@@ -1,0 +1,40 @@
+﻿"entity_id","response_id","entity","brand_raw_text"
+"P001__llama-3.3-70b-versatile__run_1__le_grand_vefour","P001__llama-3.3-70b-versatile__run_1","le grand vefour","1. **Le Grand Vefour** : Ce restaurant est situé dans le 2e arrondissement de Paris et propose une cuisine tunisienne traditionnelle avec des plats tels que le couscous, les merguez et les brik."
+"P001__llama-3.3-70b-versatile__run_1__la_maison_tunisienne","P001__llama-3.3-70b-versatile__run_1","la maison tunisienne","2. **La Maison Tunisienne** : Ce restaurant est situé dans le 11e arrondissement de Paris et offre une grande variété de plats tunisiens, y compris des plats végétariens et des desserts traditionnels."
+"P001__llama-3.3-70b-versatile__run_1__le_couscous","P001__llama-3.3-70b-versatile__run_1","le couscous","1. **Le Grand Vefour** : Ce restaurant est situé dans le 2e arrondissement de Paris et propose une cuisine tunisienne traditionnelle avec des plats tels que le couscous, les merguez et les brik."
+"P001__llama-3.3-70b-versatile__run_1__la_kasbah","P001__llama-3.3-70b-versatile__run_1","la kasbah","4. **La Kasbah** : Ce restaurant est situé dans le 10e arrondissement de Paris et propose une cuisine tunisienne moderne avec des plats tels que les tagines, les chakchoukas et les brik."
+"P001__llama-3.3-70b-versatile__run_1__le_tunisien","P001__llama-3.3-70b-versatile__run_1","le tunisien","5. **Le Tunisien** : Ce restaurant est situé dans le 12e arrondissement de Paris et offre une grande variété de plats tunisiens, y compris des plats de poisson et des desserts traditionnels."
+"P001__llama-3.3-70b-versatile__run_2__le_grand_vefour","P001__llama-3.3-70b-versatile__run_2","le grand vefour","1. **Le Grand Vefour** : Ce restaurant est situé dans le 1er arrondissement de Paris et propose une cuisine tunisienne traditionnelle avec des plats tels que le couscous, les merguez et les bricks."
+"P001__llama-3.3-70b-versatile__run_2__la_maison_tunisienne","P001__llama-3.3-70b-versatile__run_2","la maison tunisienne","2. **La Maison Tunisienne** : Ce restaurant est situé dans le 11e arrondissement de Paris et offre une cuisine tunisienne authentique avec des plats tels que le brik, le chorba et les keftas."
+"P001__llama-3.3-70b-versatile__run_2__le_tunisien","P001__llama-3.3-70b-versatile__run_2","le tunisien","3. **Le Tunisien** : Ce restaurant est situé dans le 5e arrondissement de Paris et propose une cuisine tunisienne moderne avec des plats tels que le couscous de poisson, les merguez de boeuf et les samoussas."
+"P001__llama-3.3-70b-versatile__run_2__la_medina","P001__llama-3.3-70b-versatile__run_2","la medina","4. **La Medina** : Ce restaurant est situé dans le 10e arrondissement de Paris et offre une cuisine tunisienne traditionnelle avec des plats tels que le couscous, les tagines et les pastilla."
+"P002__llama-3.3-70b-versatile__run_1__le_petit_tunis","P002__llama-3.3-70b-versatile__run_1","le petit tunis","1. **Le Petit Tunis** : situé au 34, rue de la République, 13001 Marseille. Ce restaurant propose une cuisine tunisienne traditionnelle avec des plats tels que le couscous, les tagines et les briks."
+"P002__llama-3.3-70b-versatile__run_1__tunisie_gourmande","P002__llama-3.3-70b-versatile__run_1","tunisie gourmande","2. **Tunisie Gourmande** : situé au 12, rue de la Grande Chaumière, 13002 Marseille. Ce restaurant offre une variété de plats tunisiens, y compris des spécialités telles que le harissa et les merguez."
+"P002__llama-3.3-70b-versatile__run_1__le_bardo","P002__llama-3.3-70b-versatile__run_1","le bardo","3. **Le Bardo** : situé au 23, rue de la Palud, 13006 Marseille. Ce restaurant propose une cuisine tunisienne moderne avec des plats tels que le poisson grillé et les légumes sautés."
+"P002__llama-3.3-70b-versatile__run_1__la_medina","P002__llama-3.3-70b-versatile__run_1","la medina","4. **La Medina** : situé au 15, rue de la Grande Armée, 13001 Marseille. Ce restaurant offre une atmosphère chaleureuse et des plats traditionnels tunisiens tels que le couscous et les tagines."
+"P002__llama-3.3-70b-versatile__run_1__le_souk","P002__llama-3.3-70b-versatile__run_1","le souk","5. **Le Souk** : situé au 10, rue de la République, 13001 Marseille. Ce restaurant propose une variété de plats tunisiens, y compris des spécialités telles que les briks et les merguez."
+"P002__llama-3.3-70b-versatile__run_2__le_tunisien","P002__llama-3.3-70b-versatile__run_2","le tunisien","1. **Le Tunisien** : Ce restaurant est situé au cœur de Marseille, dans le quartier de la Canebière. Il propose une cuisine traditionnelle tunisienne avec des plats tels que le couscous, les tajines et les merguez.
+ * Adresse : 12 rue de la Canebière, 13001 Marseille
+ * Téléphone : 04 91 33 22 11"
+"P002__llama-3.3-70b-versatile__run_2__dar_el_medina","P002__llama-3.3-70b-versatile__run_2","dar el medina","2. **Dar El Medina** : Ce restaurant est situé dans le quartier de la Vieille-Chapelle, à proximité du Vieux-Port de Marseille. Il propose une cuisine tunisienne authentique avec des plats tels que le brik, les keftas et les salades tunisiennes.
+ * Adresse : 15 rue de la Vieille-Chapelle, 13002 Marseille
+ * Téléphone : 04 91 33 44 55"
+"P002__llama-3.3-70b-versatile__run_2__le_comptoir_tunisien","P002__llama-3.3-70b-versatile__run_2","le comptoir tunisien","3. **Le Comptoir Tunisien** : Ce restaurant est situé dans le quartier de la Belle de Mai, à proximité de la gare de Marseille-Saint-Charles. Il propose une cuisine tunisienne avec des plats tels que le couscous, les tajines et les plats de poisson.
+ * Adresse : 23 rue de la Belle de Mai, 13003 Marseille
+ * Téléphone : 04 91 33 66 77"
+"P002__llama-3.3-70b-versatile__run_2__tunisie_gourmande","P002__llama-3.3-70b-versatile__run_2","tunisie gourmande","4. **Tunisie Gourmande** : Ce restaurant est situé dans le quartier de la Rose, à proximité du parc Borély. Il propose une cuisine tunisienne traditionnelle avec des plats tels que les merguez, les keftas et les salades tunisiennes.
+ * Adresse : 12 rue de la Rose, 13008 Marseille
+ * Téléphone : 04 91 33 88 99
+
+Pour trouver d'autres restaurants tunisiens près de vous à Marseille, vous pouvez utiliser les sites de réservation de restaurants tels que :
+
+* **LaFourchette** : un site de réservation de restaurants qui propose une liste de restaurants tunisiens à Marseille.
+* **TripAdvisor** : un site de voyage qui propose des avis et des recommandations de restaurants tunisiens à Marseille.
+* **Google Maps** : un site de cartographie qui propose une liste de restaurants tunisiens à Marseille avec leurs adresses et leurs heures d'ouverture.
+
+J'espère que cela vous aidera à trouver un restaurant tunisien qui vous convienne à Marseille !"
+"P002__llama-3.3-70b-versatile__run_2__lafourchette","P002__llama-3.3-70b-versatile__run_2","lafourchette","* **LaFourchette** : un site de réservation de restaurants qui propose une liste de restaurants tunisiens à Marseille.
+* **TripAdvisor** : un site de voyage qui propose des avis et des recommandations de restaurants tunisiens à Marseille.
+* **Google Maps** : un site de cartographie qui propose une liste de restaurants tunisiens à Marseille avec leurs adresses et leurs heures d'ouverture.
+
+J'espère que cela vous aidera à trouver un restaurant tunisien qui vous convienne à Marseille !"

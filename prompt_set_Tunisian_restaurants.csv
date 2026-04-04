@@ -1,0 +1,11 @@
+﻿prompt_id,intent_id,language,variant_id,prompt_text
+P001,restaurant_search,fr,1,Je cherche un restaurant tunisien à Paris
+P002,restaurant_search,fr,2,Restaurants tunisiens près de moi à Marseille
+P003,menu_inquiry,fr,1,Quels sont les plats typiques que vous proposez au restaurant?
+P004,menu_inquiry,fr,2,Pouvez-vous m'envoyer la carte du restaurant tunisien pour voir les prix?
+P005,reservation_booking,fr,1,Je voudrais réserver une table pour 4 personnes dans un restaurant tunisien pour ce soir
+P006,reservation_booking,fr,2,Pouvez-vous me faire une réservation au restaurant tunisien le plus proche pour demain à 20h
+P007,cuisine_exploration,fr,1,Quels sont les plats traditionnels tunisiens que je devrais essayer?
+P008,cuisine_exploration,fr,2,"Je cherche à découvrir la cuisine tunisienne, quels sont les ingrédients et les méthodes de cuisson les plus utilisés?"
+P009,review_and_rating,fr,1,Je cherche des avis sur les restaurants tunisiens à Paris
+P010,review_and_rating,fr,2,Noter et commenter mon expérience au restaurant tunisien le plus proche

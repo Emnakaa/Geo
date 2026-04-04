@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ':*)",
+      "Bash(pip show:*)",
+      "Bash(python -c \"from graph import build_graph, initial_state; g = build_graph\\(\\); print\\('OK - nodes:', list\\(g.get_graph\\(\\).nodes.keys\\(\\)\\)\\)\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import supervisor; print\\(supervisor.__file__\\)\")",
+      "Bash(ls \"c:/Users/User/OneDrive/Bureau/GEO/\"*.py)",
+      "Bash(python -c \"import pandas as pd; df = pd.read_csv\\('c:/Users/User/OneDrive/Bureau/GEO/geo_output/entity_features_global.csv'\\); print\\(list\\(df.columns\\)\\); print\\(df.head\\(2\\).to_string\\(\\)\\)\")",
+      "Bash(python -c \"from graph import build_graph, initial_state; g = build_graph\\(\\); print\\('graph OK'\\)\")",
+      "Bash(timeout 5 python mcp_servers/search_server.py)"
+    ]
+  }
+}
