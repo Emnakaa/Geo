@@ -16,11 +16,17 @@ import time
 import random
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import APIFY_API_TOKEN
+from config import APIFY_API_TOKENS
 
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("scrape-server")
+
+_apify_idx = 0
+
+
+def _apify_token() -> str:
+    return APIFY_API_TOKENS[_apify_idx] if _apify_idx < len(APIFY_API_TOKENS) else ""
 
 
 def _delay(lo=0.3, hi=0.8):
@@ -32,7 +38,7 @@ def _key_ok(k):
 
 
 @mcp.tool()
-def scrape_instagram(handle: str) -> dict:
+def scrape_instagram(handle: str | None = None) -> dict:
     """Scrape an Instagram profile via Apify.
 
     Returns: ig_followers, ig_posts, ig_engagement_rate, ig_bio, ig_scraper.
@@ -41,12 +47,12 @@ def scrape_instagram(handle: str) -> dict:
         "ig_followers": 0, "ig_posts": 0, "ig_engagement_rate": 0.0,
         "ig_bio": "", "ig_scraper": "none",
     }
-    if not handle or not _key_ok(APIFY_API_TOKEN):
+    if not handle or not _key_ok(_apify_token()):
         return result
 
     try:
         from apify_client import ApifyClient
-        client = ApifyClient(APIFY_API_TOKEN)
+        client = ApifyClient(_apify_token())
 
         run = client.actor("apify/instagram-profile-scraper").call(
             run_input={"usernames": [handle], "resultsLimit": 1},
@@ -69,18 +75,18 @@ def scrape_instagram(handle: str) -> dict:
 
 
 @mcp.tool()
-def scrape_facebook(handle: str) -> dict:
+def scrape_facebook(handle: str | None = None) -> dict:
     """Scrape a Facebook page via Apify.
 
     Returns: fb_page_likes, fb_post_engagement, fb_scraper.
     """
     result = {"fb_page_likes": 0, "fb_post_engagement": 0.0, "fb_scraper": "none"}
-    if not handle or not _key_ok(APIFY_API_TOKEN):
+    if not handle or not _key_ok(_apify_token()):
         return result
 
     try:
         from apify_client import ApifyClient
-        client = ApifyClient(APIFY_API_TOKEN)
+        client = ApifyClient(_apify_token())
 
         run = client.actor("apify/facebook-pages-scraper").call(
             run_input={
@@ -112,13 +118,13 @@ def scrape_facebook(handle: str) -> dict:
 
 
 @mcp.tool()
-def extract_website_socials(website_url: str) -> dict:
+def extract_website_socials(website_url: str | None = None) -> dict:
     """Fetch a website's HTML and extract Instagram and Facebook handles.
 
     Returns: website_ig, website_fb (handles as strings, or None).
     """
     socials = {"website_ig": None, "website_fb": None}
-    if not website_url:
+    if not website_url or not isinstance(website_url, str) or website_url.strip().lower() in ("null", "none", ""):
         return socials
 
     try:

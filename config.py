@@ -18,10 +18,28 @@ if hasattr(sys.stderr, "reconfigure"):
 load_dotenv()  # loads .env if present, no-op otherwise
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
-GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
-SERPAPI_KEY     = os.environ.get("SERPAPI_KEY", "")
-APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
+# Single-key aliases (first available key) — kept for backward compat
+GROQ_API_KEY         = os.environ.get("GROQ_API_KEY", "")
+OPENROUTER_API_KEY   = os.environ.get("OPENROUTER_API_KEY", "")
+MISTRAL_API_KEY      = os.environ.get("MISTRAL_API_KEY", "")
+SERPAPI_KEY          = os.environ.get("SERPAPI_KEY", "")
+APIFY_API_TOKEN      = os.environ.get("APIFY_API_TOKEN", "")
+
+# ── Multi-key pools (registry rotates through these on TPD exhaustion) ────────
+def _load_key_pool(base_name: str) -> list[str]:
+    """Collect all non-empty variants: BASE, BASE_2, BASE_3 … BASE_9."""
+    keys = []
+    for suffix in ["", "_2", "_3", "_4", "_5", "_6", "_7", "_8", "_9"]:
+        k = os.environ.get(f"{base_name}{suffix}", "").strip()
+        if k:
+            keys.append(k)
+    return keys
+
+GROQ_API_KEYS       = _load_key_pool("GROQ_API_KEY")
+OPENROUTER_API_KEYS = _load_key_pool("OPENROUTER_API_KEY")
+MISTRAL_API_KEYS    = _load_key_pool("MISTRAL_API_KEY")
+SERPAPI_KEYS        = _load_key_pool("SERPAPI_KEY")
+APIFY_API_TOKENS    = _load_key_pool("APIFY_API_TOKEN")
 
 # ── Model names ───────────────────────────────────────────────────────────────
 MODEL_INTENT          = "llama-3.3-70b-versatile"  # Agent 0 intent discovery
@@ -29,10 +47,27 @@ MODEL_ANALYST         = "llama-3.3-70b-versatile"  # Agent 1 heavy analysis
 MODEL_ANALYST2        = "llama-3.3-70b-versatile"
 MODEL_FALLBACK_HEAVY  = "qwen/qwen3-32b"
 
+# ── Query model slots (Agent 1 only) ─────────────────────────────────────────
+# Each slot = one measurement instrument. Groq is tried first (faster/cheaper).
+# If Groq is TPD-exhausted, OpenRouter equivalent is used so the slot still runs.
+# The slot name is what gets recorded in raw_responses — not the actual model ID —
+# so per-model GEO comparisons remain consistent across provider fallbacks.
 QUERY_MODELS = [
-    "llama-3.1-8b-instant",
-    "qwen/qwen3-32b",
-    "llama-3.3-70b-versatile",
+    {
+        "slot":        "llama-small",
+        "groq":        "llama-3.1-8b-instant",
+        "openrouter":  "meta-llama/llama-3.1-8b-instruct",
+    },
+    {
+        "slot":        "qwen-medium",
+        "groq":        "qwen/qwen3-32b",
+        "openrouter":  "qwen/qwen3-32b",
+    },
+    {
+        "slot":        "llama-large",
+        "groq":        "llama-3.3-70b-versatile",
+        "openrouter":  "meta-llama/llama-3.3-70b-instruct",
+    },
 ]
 
 MODEL_EXTRACTOR  = "mistral-small-latest"       # Mistral extraction
@@ -51,7 +86,7 @@ GROQ_FALLBACK_CHAIN = [
 ]
 
 # ── Pipeline defaults ─────────────────────────────────────────────────────────
-N_RUNS     = 2
+N_RUNS     = 5
 OUTPUT_DIR = "geo_output"
 
 # ── Derived paths (created at pipeline startup, not import time) ──────────────

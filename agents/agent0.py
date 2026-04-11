@@ -3,9 +3,7 @@
 
 import os
 import json
-import re
 import pandas as pd
-from tabulate import tabulate
 
 from config import MODEL_INTENT, MODEL_ANALYST2
 from llm_utils import call_llm
@@ -27,9 +25,20 @@ def agent0_generate_intents(domain: str, n_intents: int, model: str) -> list:
     """
     Step 1: LLM discovers relevant intent types for the given domain.
     """
-    system = """You are an expert in user behavior and search intent analysis.
-Your job is to identify the most realistic and diverse intent types
-that users express when querying an AI assistant about a specific domain.
+    system = """You are an expert in user behavior and search intent analysis, specialising in GEO (Generative Engine Optimization) research.
+Your job is to identify the most realistic and diverse intent types that users express when querying an AI assistant about a specific domain.
+
+STRICT RULES for GEO-valid intents:
+1. Every intent must produce prompts where a user asks an AI ABOUT establishments — never TO an establishment.
+   INVALID: "Quels sont les plats de votre restaurant ?" (addresses the AI as if it IS the restaurant)
+   VALID:   "Quels sont les restaurants tunisiens les plus réputés à Tunis ?"
+2. Every intent must be geographically anchored to the country/city in the domain — never drift to other cities or countries.
+   INVALID for domain "Tunisian restaurants": prompts about Paris, Lyon, France
+   VALID: prompts about Tunis, Sousse, Sfax, Djerba, Monastir, Hammamet
+3. Every intent must naturally lead to naming SPECIFIC establishments — not generic cuisine descriptions.
+   INVALID: "Comment prépare-t-on le couscous ?" (about food, not brands)
+   VALID:   "Quel restaurant tunisien est réputé pour son couscous à Sousse ?"
+
 Always respond in valid JSON only, no explanation, no markdown."""
 
     prompt = f"""Domain: {domain}
@@ -40,14 +49,14 @@ when asking an AI assistant about this domain.
 For each intent provide:
 - intent_id: short snake_case identifier
 - intent_name: clear label
-- description: one sentence explaining this intent type
+- description: one sentence explaining this intent type (must follow the 3 GEO rules above)
 
 Respond ONLY with a JSON array like:
 [
   {{
-    "intent_id": "recommendation",
-    "intent_name": "General Recommendation",
-    "description": "User wants the AI to suggest the best options in the domain"
+    "intent_id": "top_recommendation",
+    "intent_name": "Top Restaurant Recommendation",
+    "description": "User wants the AI to name the best-known or most reputed restaurants in a specific Tunisian city"
   }}
 ]"""
 
@@ -64,25 +73,34 @@ def agent0_generate_prompts(domain: str, intents: list, languages: list,
     """
     Step 2: For each intent, generate n_variants prompts per language.
     """
-    system = """You are an expert in prompt engineering and multilingual NLP.
-Your job is to generate realistic, diverse user queries for a given intent and domain.
-Queries must sound natural, like something a real user would type.
+    system = """You are an expert in prompt engineering and multilingual NLP, specialising in GEO (Generative Engine Optimization) research.
+Your job is to generate realistic, diverse user queries that will reveal which specific brands or establishments an AI assistant knows.
+
+CRITICAL GEO RULE: At least 60% of prompts must be phrased to force the AI to recall and name SPECIFIC, WELL-KNOWN establishments.
+- GOOD: "Quel est le restaurant tunisien le plus réputé à Tunis ?" → forces naming a known brand
+- GOOD: "Cite-moi les 3 meilleures adresses pour manger tunisien à Tunis"  → forces a ranked list of real names
+- BAD:  "Tu connais un bon resto tunisien ?" → too vague, invites invention
+- BAD:  "Quels sont les plats de votre restaurant ?" → asks the AI as if it IS the restaurant
+
+Prompts that ask for hours, menus of unnamed restaurants, or generic cuisine descriptions do NOT help GEO — avoid them.
 Always respond in valid JSON only, no explanation, no markdown."""
 
     all_prompts = []
 
     for intent in intents:
         prompt = f"""Domain: {domain}
-Intent: {intent['intent_name']} {intent['description']}
+Intent: {intent['intent_name']} — {intent['description']}
 Languages: {languages}
 Number of variants per language: {n_variants}
 
 Generate {n_variants} natural user queries for EACH of these languages: {languages}
+
 Queries must:
 - Sound like real user input, not formal questions
-- Be diverse in phrasing (avoid repetition)
-- Be relevant to the domain and intent
-- Vary in length and structure
+- Be phrased to elicit SPECIFIC establishment names (use superlatives, rankings, "cite", "liste", "le meilleur", "les plus connus")
+- Be geographically precise (name a city or neighbourhood, not just "Tunisie" generically)
+- Be diverse in phrasing and structure
+- Stay within the domain and intent
 
 Respond ONLY with a JSON array like:
 [
@@ -156,18 +174,25 @@ def agent0_reflect(domain: str, intents: list,
 Intents discovered: {[i['intent_id'] for i in intents]}
 Total prompts generated: {len(prompts_df)}
 Languages: {prompts_df['language'].unique().tolist()}
-Sample prompts: {prompts_df['prompt_text'].head(6).tolist()}
+All prompts:
+{prompts_df['prompt_text'].tolist()}
 
-Evaluate the quality of this prompt set:
+Evaluate the quality of this prompt set for GEO (Generative Engine Optimization) research:
+
 1. Are the intents diverse enough for GEO analysis?
 2. Are there important intents missing?
 3. Are prompts natural and realistic?
 4. Is language quality acceptable?
+5. GEO CRITICAL — Do at least 60% of prompts force the AI to name SPECIFIC known establishments?
+   Count prompts that use superlatives, rankings, "cite", "liste", "le meilleur", "les plus connus", or name a specific place.
+   Prompts asking for hours, menus, or generic cuisine info do NOT count.
+   If fewer than 60% force specific naming → set proceed: false and list them in issues.
 
 Respond ONLY with:
 {{
   "quality_score": 0-10,
   "proceed": true/false,
+  "brand_eliciting_pct": <percentage of prompts that force specific brand naming>,
   "missing_intents": [],
   "issues": [],
   "recommendation": "..."

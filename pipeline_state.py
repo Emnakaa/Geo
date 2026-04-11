@@ -1,4 +1,4 @@
-"""Shared LangGraph state definition for the GEO pipeline."""
+"""Shared pipeline state definition and factory for the GEO pipeline."""
 
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -40,3 +40,38 @@ class PipelineState(TypedDict):
     # ── Control flow ──────────────────────────────────────────────────────────
     errors: List[str]    # non-fatal errors appended by each node
     current_step: str    # last completed step label
+
+
+def initial_state(
+    domain: str,
+    languages: list | None = None,
+    n_intents: int = 4,
+    n_variants: int = 3,
+    max_reflection_loops: int = 2,
+    max_retries: int = 1,
+) -> "PipelineState":
+    """Return a fully-initialised state dict ready for the orchestrator."""
+    return PipelineState(
+        domain               = domain,
+        languages            = languages or ["fr"],
+        n_intents            = n_intents,
+        n_variants           = n_variants,
+        max_reflection_loops = max_reflection_loops,
+        intents              = [],
+        prompt_set           = [],
+        agent0_quality_score = None,
+        raw_responses        = [],
+        extracted_entities   = [],
+        clean_entities       = [],
+        entity_features      = [],
+        entity_features_global = [],
+        web_features         = [],
+        agent0_retries       = 0,
+        agent1_retries       = 0,
+        agent2_retries       = 0,
+        max_retries          = max_retries,
+        supervisor_notes     = [],
+        token_usage          = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        errors               = [],
+        current_step         = "init",
+    )

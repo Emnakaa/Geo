@@ -1,13 +1,17 @@
-"""Shared LLM call utility backed by the dynamic ModelRegistry.
+"""Shared LLM call utility — multi-provider, fully autonomous model selection.
 
-Model selection is driven by real-time availability state — no hardcoded
-fallback lists. When a model is rate-limited the registry is updated and
-the next call automatically picks the next best available model.
+Providers: Groq (fast, free tier) + OpenRouter (broad model catalog).
+The registry selects the best available model+provider for each call based on:
+  - Current availability (not TPD-exhausted, not TPM-blocked)
+  - Learned token capacity (models too small for the prompt are auto-skipped)
+  - Capability tier (best quality model wins)
+
+No hardcoded fallback chains. The system decides autonomously.
 
 Usage:
     from llm_utils import call_llm, call_llm_json
 
-    text   = call_llm(prompt="...", system="...", preferred_model="llama-3.3-70b-versatile")
+    text   = call_llm(prompt="...", preferred_model="llama-3.3-70b-versatile")
     result = call_llm_json(prompt="...", preferred_model="llama-3.3-70b-versatile")
 """
 
@@ -19,37 +23,95 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from groq import Groq, RateLimitError
-from config import GROQ_API_KEY
+from groq import Groq
+from config import GROQ_API_KEYS, OPENROUTER_API_KEYS
 from model_registry import registry
 
+GROQ_API_KEY       = GROQ_API_KEYS[0]       if GROQ_API_KEYS       else ""
+OPENROUTER_API_KEY = OPENROUTER_API_KEYS[0] if OPENROUTER_API_KEYS else ""
 
-_client: Groq | None = None
+try:
+    from groq import RateLimitError as _GroqRLE
+except ImportError:
+    _GroqRLE = Exception
 
-def _get_client() -> Groq:
-    global _client
-    if _client is None:
-        _client = Groq(api_key=GROQ_API_KEY)
-    return _client
+try:
+    from openai import OpenAI as _OpenAI, RateLimitError as _OpenAIRLE
+    _HAS_OPENAI = True
+except ImportError:
+    _OpenAI = None
+    _OpenAIRLE = type("_never", (), {})
+    _HAS_OPENAI = False
+
+_RateLimitErrors = (_GroqRLE, _OpenAIRLE)
+
+ 
+# Clients lazy singletons
+ 
+
+_client_cache: dict = {}
 
 
-def _parse_wait_seconds(error_message: str) -> float:
-    """Extract retry-after from Groq error message."""
-    m = re.search(
-        r"try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?",
-        error_message,
-    )
+def _client_for(provider: str, api_key: str = "") -> Groq:
+    """Return a cached client for the given provider and key."""
+    key = f"{provider}::{api_key}"
+    if key in _client_cache:
+        return _client_cache[key]
+    if provider == "openrouter":
+        if not _HAS_OPENAI:
+            raise RuntimeError("openai package required for OpenRouter  pip install openai")
+        client = _OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key or OPENROUTER_API_KEY,
+            default_headers={
+                "HTTP-Referer": "https://github.com/geo-pipeline",
+                "X-Title": "GEO Pipeline",
+            },
+        )
+    else:
+        client = Groq(api_key=api_key or GROQ_API_KEY)
+    _client_cache[key] = client
+    return client
+
+
+ 
+# Helpers
+ 
+
+def _parse_wait_seconds(msg: str) -> float:
+    m = re.search(r"try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", msg)
     if not m:
         return 60.0
-    h    = float(m.group(1) or 0)
-    mins = float(m.group(2) or 0)
-    s    = float(m.group(3) or 0)
-    return h * 3600 + mins * 60 + s
+    return float(m.group(1) or 0) * 3600 + float(m.group(2) or 0) * 60 + float(m.group(3) or 0)
 
 
-def _is_daily_limit(error_message: str) -> bool:
-    return "tokens per day" in error_message or "per day" in error_message
+def _parse_413(msg: str):
+    """Extract (limit, requested) token counts from 413 message."""
+    m = re.search(r"Limit\s+(\d+),\s*Requested\s+(\d+)", msg, re.I)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
 
+
+def _is_daily_limit(msg: str) -> bool:
+    return "tokens per day" in msg or "per day" in msg or "daily" in msg.lower()
+
+
+def _is_too_large(msg: str) -> bool:
+    return "413" in msg or "request too large" in msg.lower() or "context_length_exceeded" in msg.lower()
+
+
+def _is_insufficient_credits(msg: str) -> bool:
+    return "402" in msg or "requires more credits" in msg.lower() or "can only afford" in msg.lower()
+
+
+def _estimate_tokens(messages: list) -> int:
+    return sum(len(m.get("content", "")) for m in messages) // 4
+
+
+ 
+# Core call
+ 
 
 def call_llm(
     prompt: str,
@@ -58,92 +120,97 @@ def call_llm(
     max_completion_tokens: int = 4096,
     temperature: float = 0.2,
     tpm_max_wait: float = 90.0,
-    max_attempts: int = 6,
+    max_attempts: int = 10,
 ) -> str:
-    """Call the best available Groq model with automatic failover.
+    """Call the best available model with automatic multi-provider failover.
 
-    The registry selects the model dynamically based on current availability.
-    On rate-limit errors the registry is updated and the next call picks
-    a different model — no hardcoded fallback chain.
-
-    Args:
-        prompt:               User message.
-        system:               System message (optional).
-        preferred_model:      Hint to the registry — used if available.
-        max_completion_tokens: Token budget for the response.
-        temperature:          Sampling temperature.
-        tpm_max_wait:         Max seconds to wait on TPM before trying another model.
-        max_attempts:         Total attempts across all models before giving up.
-
-    Returns:
-        Response text string.
-
-    Raises:
-        RuntimeError: If all models are exhausted.
+    Returns response text. Raises RuntimeError if all models are exhausted.
     """
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    estimated = _estimate_tokens(messages)
     last_error = None
 
     for attempt in range(max_attempts):
-        model = registry.select(preferred=preferred_model)
+        model, provider, api_key = registry.select(
+            preferred=preferred_model,
+            estimated_tokens=estimated,
+        )
 
         try:
-            resp = _get_client().chat.completions.create(
+            client = _client_for(provider, api_key)
+            resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature,
-                max_completion_tokens=max_completion_tokens,
+                max_tokens=max_completion_tokens,
             )
             content = resp.choices[0].message.content
             if not content or not content.strip():
-                print(f"[llm] {model}: empty response — blocking 60s and trying another model")
-                registry.mark_tpm(model, 60)
+                print(f"[llm] {provider}/{model}: empty response — blocking 60s")
+                registry.mark_tpm(model, provider, 60, api_key)
                 continue
             return content.strip()
 
-        except RateLimitError as e:
+        except _RateLimitErrors as e:
             msg = str(e)
             last_error = e
 
-            if _is_daily_limit(msg):
-                registry.mark_tpd_exhausted(model)
-                # Loop immediately — registry will pick a different model
+            if _is_too_large(msg):
+                parsed = _parse_413(msg)
+                if parsed:
+                    registry.mark_too_large(model, provider, *parsed)
+                else:
+                    registry.mark_tpm(model, provider, 3600, api_key)
                 continue
 
-            # TPM limit
+            if _is_daily_limit(msg) or _is_insufficient_credits(msg):
+                registry.mark_tpd_exhausted(model, provider, api_key)
+                print(f"[llm] {provider}/{model}: credits/daily limit — skipping")
+                continue
+
             wait = _parse_wait_seconds(msg)
             if wait <= tpm_max_wait:
-                registry.mark_tpm(model, wait)
-                print(f"[llm] Waiting {wait:.0f}s for TPM reset on {model}...")
+                registry.mark_tpm(model, provider, wait, api_key)
+                print(f"[llm] {provider}/{model}: TPM — waiting {wait:.0f}s...")
                 time.sleep(wait + 1)
-                # After wait, preferred model should be available again
             else:
-                # Wait too long — block this model temporarily and try another
-                registry.mark_tpm(model, wait)
-                print(f"[llm] TPM wait {wait:.0f}s too long — trying another model")
+                registry.mark_tpm(model, provider, wait, api_key)
+                print(f"[llm] {provider}/{model}: TPM wait {wait:.0f}s too long — skipping")
                 continue
 
         except Exception as e:
-            last_error = e
             msg = str(e)
-            print(f"[llm] {model}: unexpected error ({e}) — trying another model")
-            if "400" in msg or "invalid_request_error" in msg:
-                # Bad request — this model won't recover, block it for the session
-                registry.mark_tpm(model, 3600)
+            last_error = e
+            print(f"[llm] {provider}/{model}: error ({e})")
+
+            if _is_too_large(msg):
+                parsed = _parse_413(msg)
+                if parsed:
+                    registry.mark_too_large(model, provider, *parsed)
+                else:
+                    registry.mark_tpm(model, provider, 3600, api_key)
+            elif _is_insufficient_credits(msg):
+                print(f"[llm] {provider}/{model}: insufficient credits — skipping permanently")
+                registry.mark_tpd_exhausted(model, provider, api_key)
+            elif "400" in msg or "invalid_request_error" in msg:
+                registry.mark_tpm(model, provider, 3600, api_key)
             else:
                 time.sleep(2 ** min(attempt, 4))
             continue
 
     raise RuntimeError(
         f"All models exhausted after {max_attempts} attempts. "
-        f"Last error: {last_error}\n"
-        f"Registry status: {registry.status()}"
+        f"Last error: {last_error}"
     )
 
+
+ 
+# JSON wrapper
+ 
 
 def call_llm_json(
     prompt: str,

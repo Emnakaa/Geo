@@ -9,41 +9,73 @@ import time
 import requests
 import pandas as pd
 import csv
-from groq import Groq, RateLimitError
+from groq import Groq
 from tabulate import tabulate
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from config import GROQ_API_KEY, MISTRAL_API_KEY
+from config import GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY
 from model_registry import registry as _model_registry
 
-# Lazy Groq client — never instantiated at import time.
-_groq_client: Groq | None = None
+try:
+    from groq import RateLimitError as _GroqRLE
+except ImportError:
+    _GroqRLE = Exception
 
-def _get_client() -> Groq:
-    global _groq_client
-    if _groq_client is None:
-        _groq_client = Groq(api_key=GROQ_API_KEY)
-    return _groq_client
+try:
+    from openai import OpenAI as _OpenAI, RateLimitError as _OpenAIRLE
+    _HAS_OPENAI = True
+except ImportError:
+    _OpenAI = None
+    _OpenAIRLE = type("_never", (), {})
+    _HAS_OPENAI = False
+
+RateLimitError = (_GroqRLE, _OpenAIRLE)
+
+# Client cache — keyed by "provider::api_key" so each key gets its own instance.
+_client_cache: dict = {}
+
+
+def _get_client(provider: str = "groq", api_key: str = ""):
+    """Return an API client for the given provider and key.
+
+    Clients are cached per (provider, api_key) pair so we don't recreate
+    them on every call, but different keys get separate client instances.
+    """
+    cache_key = f"{provider}::{api_key}"
+    if cache_key in _client_cache:
+        return _client_cache[cache_key]
+
+    if provider == "openrouter":
+        if not _HAS_OPENAI:
+            raise RuntimeError("pip install openai required for OpenRouter")
+        client = _OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key or OPENROUTER_API_KEY,
+            default_headers={
+                "HTTP-Referer": "https://github.com/geo-pipeline",
+                "X-Title": "GEO Pipeline",
+            },
+        )
+    else:
+        client = Groq(api_key=api_key or GROQ_API_KEY)
+
+    _client_cache[cache_key] = client
+    return client
 
 """# **Imports, Config**"""
 
 # config
-QUERY_MODELS = [
-    "llama-3.1-8b-instant",
-    "qwen/qwen3-32b",
-    #"moonshotai/kimi-k2-instruct-0905",
-    "llama-3.3-70b-versatile",
-]
+from config import QUERY_MODELS as QUERY_MODELS
 
 MODEL_EXTRACTOR       ="mistral-small-latest" #"llama-3.3-70b-versatile"
 MODEL_EXTRACTOR2      ="llama-3.3-70b-versatile"
 MODEL_EXTRACTOR3      ="llama-3.1-8b-instant"
-MODEL_ANALYST         = "openai/gpt-oss-120b"
+MODEL_ANALYST         = "llama-3.3-70b-versatile"
 MODEL_ANALYST2         = "llama-3.3-70b-versatile"
 MODEL_FALLBACK_HEAVY  = "qwen/qwen3-32b"
 
-N_RUNS          = 2
+from config import N_RUNS
 OUTPUT_DIR      = "geo_output"
 RAW_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "raw_responses.csv")
 
@@ -65,20 +97,22 @@ def _track_tokens(usage: dict) -> None:
         TOKEN_USAGE[key] += usage.get(key, 0)
 
 # model params
-def _model_params(model: str, role: str = "analyst") -> dict:
+def _model_params(model: str, role: str = "analyst", provider: str = "groq") -> dict:
     if role == "query":
         base = {"temperature": 0.7, "max_tokens": 8192, "top_p": 0.9}
     elif role == "extractor":
         base = {"temperature": 0.0, "max_tokens": 1024, "top_p": 1.0}
     elif role == "analyst":
         base = {"temperature": 0.1, "max_tokens": 8192, "top_p": 0.95}
-        if "gpt-oss" in model.lower():
-            base["reasoning_effort"] = "low"
     else:
         base = {"temperature": 0.2, "max_tokens": 8192, "top_p": 0.9}
 
-    if "qwen3" in model.lower():
-        base["reasoning_effort"] = "none"
+    # Groq-specific params — not supported on OpenRouter
+    if provider == "groq":
+        if "gpt-oss" in model.lower():
+            base["reasoning_effort"] = "low"
+        if "qwen3" in model.lower():
+            base["reasoning_effort"] = "none"
 
     return base
 
@@ -105,11 +139,24 @@ FATAL_ERRORS = [
 ]
 
 # query_llm
-def query_llm(model: str, prompt: str, system: str = "",
+def _parse_413_agent1(err_msg: str):
+    """Extract (limit, requested) from a 413 error. Returns (limit, requested) or None."""
+    import re as _re
+    m = _re.search(r"Limit\s+(\d+),\s*Requested\s+(\d+)", err_msg, _re.I)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def query_llm(model: str | None, prompt: str, system: str = "",
               retries: int = 3, role: str = "analyst") -> dict:
     """
     Single LLM call with retry, rate limit handling, token tracking,
     and automatic model fallback via the dynamic ModelRegistry.
+
+    413 (request too large) errors teach the registry the model's token
+    capacity so future large prompts skip too-small models automatically.
+
     role: query | extractor | analyst
     """
     empty = {"raw_response": "", "completion_tokens": 0,
@@ -120,16 +167,25 @@ def query_llm(model: str, prompt: str, system: str = "",
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    # Estimated tokens = prompt chars/4 + max_completion_tokens for this role.
+    # Including completion budget is critical: a 6000 TPM model cannot serve
+    # a 56-token prompt if max_tokens=8192 (total = 8248 > 6000).
+    _role_max = {"query": 8192, "extractor": 1024, "analyst": 8192}
+    prompt_tokens_est = sum(len(m.get("content", "")) for m in messages) // 4
+    estimated = prompt_tokens_est + _role_max.get(role, 4096)
+
     for attempt in range(retries * 4):  # enough room to cycle through models
         try:
-            candidate = _model_registry.select(preferred=model)
+            candidate, provider, api_key = _model_registry.select(
+                preferred=model, estimated_tokens=estimated
+            )
         except RuntimeError as e:
             print(f"[ERROR] {e}")
             return empty
 
         try:
-            params   = _model_params(candidate, role=role)
-            response = _get_client().chat.completions.create(
+            params   = _model_params(candidate, role=role, provider=provider)
+            response = _get_client(provider, api_key).chat.completions.create(
                 model    = candidate,
                 messages = messages,
                 stop     = None,
@@ -140,32 +196,57 @@ def query_llm(model: str, prompt: str, system: str = "",
                 "completion_tokens": response.usage.completion_tokens,
                 "prompt_tokens":     response.usage.prompt_tokens,
                 "total_tokens":      response.usage.total_tokens,
+                "model_id":          candidate,
+                "provider":          provider,
             }
             _track_tokens(result)
-            if candidate != model:
-                print(f"[llm] Used fallback model: {candidate}")
+            if candidate != model or provider != "groq":
+                print(f"[llm] Used: {provider}/{candidate}")
             return result
 
         except RateLimitError as e:
             err_msg = str(e)
-            if "tokens per day" in err_msg or "per day" in err_msg:
-                _model_registry.mark_tpd_exhausted(candidate)
+            if "413" in err_msg or "request too large" in err_msg.lower():
+                parsed = _parse_413_agent1(err_msg)
+                if parsed:
+                    _model_registry.mark_too_large(candidate, provider, *parsed)
+                else:
+                    _model_registry.mark_tpm(candidate, provider, 3600)
+                continue
+            if ("tokens per day" in err_msg or "per day" in err_msg
+                    or "daily" in err_msg.lower()
+                    or "402" in err_msg or "requires more credits" in err_msg.lower()
+                    or "can only afford" in err_msg.lower()):
+                _model_registry.mark_tpd_exhausted(candidate, provider, api_key)
+                print(f"[llm] {provider}/{candidate}: credits/daily limit — skipping")
             else:
                 wait = _parse_wait_time(err_msg)
                 if wait > 0 and wait <= 90:
-                    _model_registry.mark_tpm(candidate, wait)
-                    print(f"[RATE LIMIT] {candidate}: waiting {wait:.0f}s...")
+                    _model_registry.mark_tpm(candidate, provider, wait, api_key)
+                    print(f"[RATE LIMIT] {provider}/{candidate}: waiting {wait:.0f}s...")
                     time.sleep(wait + 2)
                 else:
-                    _model_registry.mark_tpm(candidate, wait)
-                    print(f"[RATE LIMIT] {candidate}: wait {wait:.0f}s — trying another model")
+                    _model_registry.mark_tpm(candidate, provider, max(wait, 60), api_key)
+                    print(f"[RATE LIMIT] {provider}/{candidate}: wait {wait:.0f}s — skipping")
 
         except Exception as e:
             err_msg = str(e)
-            print(f"[WARN] {candidate}: {e}")
+            print(f"[WARN] {provider}/{candidate}: {e}")
             if any(msg in err_msg.lower() for msg in FATAL_ERRORS):
                 print(f"[FATAL] Non-recoverable error: {err_msg}")
                 return empty
+            if "413" in err_msg or "request too large" in err_msg.lower():
+                parsed = _parse_413_agent1(err_msg)
+                if parsed:
+                    _model_registry.mark_too_large(candidate, provider, *parsed)
+                else:
+                    _model_registry.mark_tpm(candidate, provider, 3600, api_key)
+                continue
+            if ("402" in err_msg or "requires more credits" in err_msg.lower()
+                    or "can only afford" in err_msg.lower()):
+                print(f"[llm] {provider}/{candidate}: insufficient credits — skipping permanently")
+                _model_registry.mark_tpd_exhausted(candidate, provider, api_key)
+                continue
             time.sleep(2 ** min(attempt, 4))
 
     print(f"[ERROR] All models exhausted.")
@@ -266,38 +347,42 @@ PROMPT_SET_PATH = "prompt_set_Tunisian_restaurants.csv"  # default path used by 
 """
 
 def agent1_query_prompts(
-    prompts:     list,
-    models:      list = QUERY_MODELS,
-    n_runs:      int  = N_RUNS,
-    output_path: str  = RAW_OUTPUT_PATH,
+    prompts:      list,
+    query_models: list | None = None,
+    n_runs:       int  = N_RUNS,
+    output_path:  str  = RAW_OUTPUT_PATH,
 ) -> pd.DataFrame:
     """
-    Step 2: LLM querying with progressive saving and resume support.
+    Step 2: LLM querying — each prompt is sent to every model in query_models,
+    repeated n_runs times per model. This cross-model, multi-run design is the
+    core of GEO measurement: visibility is only meaningful when measured across
+    diverse LLMs, not a single model.
 
-    For each prompt x each model x n_runs:
-        -> query_llm(role="query")
-        -> save record to CSV immediately
+    Resume support: skips (prompt_id, model_id, run_id) triples already saved.
     """
+    if query_models is None:
+        query_models = QUERY_MODELS
 
-    # resume support
+    # resume support — key is (prompt_id, slot, run_id)
     done_keys = set()
     if os.path.exists(output_path):
         df_existing = pd.read_csv(
             output_path, encoding='utf-8-sig', quoting=csv.QUOTE_ALL
         )
         for _, row in df_existing.iterrows():
-            done_keys.add((row['prompt_id'], row['model_id'], row['run_id']))
+            done_keys.add((row['prompt_id'], str(row.get('model_slot', row['model_id'])), row['run_id']))
         print(f"Resuming - {len(done_keys)} records already saved")
 
     total_prompts  = len(prompts)
-    total_calls    = total_prompts * len(models) * n_runs
+    total_calls    = total_prompts * len(query_models) * n_runs
     done_calls     = len(done_keys)
     header_written = os.path.exists(output_path)
 
-    print(f"\nStep 2: LLM querying")
+    slot_names = [s["slot"] if isinstance(s, dict) else s for s in query_models]
+    print(f"\nStep 2: LLM querying (multi-model, multi-run)")
     print(f"   Prompts        : {total_prompts}")
-    print(f"   Models         : {models}")
-    print(f"   Runs/prompt    : {n_runs}")
+    print(f"   Query slots    : {slot_names}")
+    print(f"   Runs/slot      : {n_runs}")
     print(f"   Total calls    : {total_calls}")
     print(f"   Already done   : {done_calls}")
     print(f"   Remaining      : {total_calls - done_calls}\n")
@@ -311,40 +396,71 @@ def agent1_query_prompts(
         print(f"\n[{i+1}/{total_prompts}] {prompt_id} | {intent_id} | {language}")
         print(f"  Prompt: {prompt_text[:80]}{'...' if len(prompt_text) > 80 else ''}")
 
-        for model_id in models:
-            print(f"\n  Model: {model_id}")
+        for slot_def in query_models:
+            # Support both old string format and new slot dict format
+            if isinstance(slot_def, dict):
+                slot      = slot_def["slot"]
+                groq_id   = slot_def.get("groq", "")
+                or_id     = slot_def.get("openrouter", "")
+                # Ordered candidate list: Groq first, OpenRouter as fallback
+                candidates = [(groq_id, "groq"), (or_id, "openrouter")]
+            else:
+                slot      = slot_def
+                candidates = [(slot_def, None)]   # old behaviour — registry decides
 
             for run_idx in range(1, n_runs + 1):
-                run_id      = f"run_{run_idx}"
-                response_id = f"{prompt_id}__{model_id.replace('/', '-')}__{run_id}"
+                run_id = f"run_{run_idx}"
 
-                # skip if already done
-                if (prompt_id, model_id, run_id) in done_keys:
-                    print(f"     [{run_id}] skipped ({response_id})")
+                if (prompt_id, slot, run_id) in done_keys:
+                    print(f"     [{slot}][{run_id}] already done — skipping")
                     continue
 
-                result = query_llm(
-                    model  = model_id,
-                    prompt = prompt_text,
-                    role   = "query"
-                )
+                result = None
+                used_model = None
+                used_provider = None
 
-                if not result['raw_response']:
-                    print(f"     [{run_id}] empty response, skipping")
+                for cand_model, cand_provider in candidates:
+                    if not cand_model:
+                        continue
+                    r = query_llm(
+                        model  = cand_model,
+                        prompt = prompt_text,
+                        role   = "query",
+                    )
+                    returned_model    = r.get("model_id", "")
+                    returned_provider = r.get("provider", "")
+                    # Accept only if the registry actually used the intended model
+                    # (not a fallback to a different model family/slot)
+                    if r.get('raw_response') and returned_model == cand_model:
+                        result        = r
+                        used_model    = returned_model or cand_model
+                        used_provider = returned_provider or cand_provider or ""
+                        break
+                    if r.get('raw_response'):
+                        # Got a response but from a wrong slot model — skip
+                        print(f"     [{slot}] {cand_provider}/{cand_model} redirected to {returned_provider}/{returned_model} — trying next slot candidate")
+                    else:
+                        print(f"     [{slot}] {cand_provider}/{cand_model} failed — trying next")
+
+                if not result or not result.get('raw_response'):
+                    print(f"     [{slot}][{run_id}] all candidates failed — skipping")
                     continue
+
+                response_id = f"{prompt_id}__{slot}__{run_id}"
 
                 record = {
-                "response_id"      : response_id,   # PK
-                "prompt_id"        : prompt_id,     # FK → prompts.csv
-                "model_id"         : model_id,
-                "run_id"           : run_id,
-                "response_text"    : result['raw_response'],
-                "completion_tokens": result['completion_tokens'],
-                "prompt_tokens"    : result['prompt_tokens'],
-                "total_tokens"     : result['total_tokens'],
-                "timestamp"        : time.time(),
-            }
-                # progressive save - one record at a time
+                    "response_id"      : response_id,
+                    "prompt_id"        : prompt_id,
+                    "model_slot"       : slot,
+                    "model_id"         : used_model,
+                    "provider"         : used_provider,
+                    "run_id"           : run_id,
+                    "response_text"    : result['raw_response'],
+                    "completion_tokens": result['completion_tokens'],
+                    "prompt_tokens"    : result['prompt_tokens'],
+                    "total_tokens"     : result['total_tokens'],
+                    "timestamp"        : time.time(),
+                }
                 pd.DataFrame([record]).to_csv(
                     output_path,
                     mode     = 'a',
@@ -354,18 +470,16 @@ def agent1_query_prompts(
                     quoting  = csv.QUOTE_ALL
                 )
                 header_written = True
-                done_keys.add((prompt_id, model_id, run_id))
+                done_keys.add((prompt_id, slot, run_id))
+                print(f"     [{slot} → {used_provider}/{used_model}][{run_id}] {result['total_tokens']} tokens")
 
-                print(f"     [{run_id}] {result['total_tokens']} tokens | {response_id}")
-
-    # final summary
     df_raw = pd.read_csv(output_path, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
 
     print(f"\n{'='*55}")
     print(f"Step 2 complete")
     print(f"   Total records  : {len(df_raw)}")
     print(f"   Prompts covered: {df_raw['prompt_id'].nunique()}")
-    print(f"   Models used    : {df_raw['model_id'].unique().tolist()}")
+    print(f"   Slots used     : {df_raw['model_slot'].unique().tolist() if 'model_slot' in df_raw.columns else df_raw['model_id'].unique().tolist()}")
     print(f"   Total tokens   : {TOKEN_USAGE['total_tokens']}")
     print(f"   Saved to       : {output_path}")
     print(f"{'='*55}")
@@ -487,11 +601,27 @@ ENTITIES_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "extracted_entities.csv")
 
 
 BRAND_EXTRACTION_SYSTEM = """\
-You are a restaurant name extractor working in a GEO analysis pipeline.
+You are a restaurant name extractor working in a GEO analysis pipeline
+that studies TUNISIAN restaurants — establishments serving Tunisian /
+North-African cuisine, or restaurants located inside Tunisia.
 
 Your ONLY task is to find every named restaurant, cafe, or food business
 in the text. The text may be a numbered list, markdown table, bold headers,
 or free-form prose - read ALL formats.
+
+════════════════════════════════════════════════════
+DOMAIN SCOPE — CRITICAL
+════════════════════════════════════════════════════
+Only extract establishments that are plausibly Tunisian:
+  + Located in Tunisia (any city)
+  + Serving Tunisian / North-African / Maghrebi cuisine
+  + Tunisian-diaspora restaurants abroad known for Tunisian food
+
+EXCLUDE any establishment that has NO Tunisian connection:
+  - Any internationally known chain or restaurant with no Tunisian /
+    North-African cuisine context in the surrounding text
+  - If the surrounding text shows no Tunisian / Maghrebi food signal
+    for that name → skip it
 
 ════════════════════════════════════════════════════
 WHAT TO EXTRACT
@@ -512,6 +642,8 @@ Exclude items that are NOT a proper establishment name:
     ("a local restaurant", "the best cafe", "street food stalls")
   - City or region names  ("Tunis", "Sfax", "Djerba", "Tunisia")
   - People names          ("Chef Ahmed", "Mohamed")
+  - Digital platforms, apps, or websites — anything that is a service for
+    finding or booking restaurants, not a physical food establishment itself
 
 NOTE: "sandwich" or "pizza" as PART of a business name is allowed.
   KEEP  -> "sandwich chez ahmed"
@@ -754,7 +886,7 @@ def agent1_extract_entities(
          description_length · list_vs_prose · attribute_tags
 
          Input  : extracted_entities.csv + raw_responses.csv
-LLM    : MODEL_ANALYST (gpt-oss-120b)
+LLM    : MODEL_ANALYST (llama-3.3-70b-versatile)
 Extracts per (prompt_id × entity):
          mention_count · ranking_position ·
          first_mention_position · list_vs_prose ·
@@ -1113,8 +1245,8 @@ def phase_b_fuzzy_cluster(
 
 ARBITRATION_SYSTEM = """\
 You are an entity resolution and validation specialist for a restaurant
-GEO analysis pipeline analyzing Tunisian restaurants
-(in Tunisia and abroad including Paris and other cities).
+GEO analysis pipeline studying TUNISIAN restaurants — establishments
+serving Tunisian / North-African cuisine, or restaurants located in Tunisia.
 
 You have TWO tasks:
 
@@ -1134,20 +1266,24 @@ DIFFERENT when:
   - Any genuine doubt                  -> DIFFERENT
 
 TASK 2 — ENTITY VALIDATION
-For each entity and its context, decide if it is a real
-restaurant, cafe, or food business.
+For each entity and its context, decide if it is a real Tunisian /
+North-African restaurant, cafe, or food business.
 
-IMPORTANT — be very conservative:
-  - If context mentions food, dining, service, cuisine -> valid = true
-  - Names like "le sfax", "le djerba", "le marrakech", "le bardo"
-    are Paris restaurants named after cities -> valid = true
-  - Only invalidate if context CLEARLY describes something
-    that is NOT a restaurant:
-      a mosque, museum, monument, mathematician,
-      a standalone dish with no restaurant context,
-      a city or region with no restaurant context
-  - When uncertain -> valid = true
-  - Prefer false negatives over false positives
+VALIDATION RULES (apply in order):
+  1. Valid = true  if context clearly mentions Tunisian or North-African
+     food culture (couscous, brik, harissa, tajine, merguez, lablabi,
+     malouf, Tunisian, Maghrebi, North African, Carthage, Medina …)
+  2. Valid = true  if the name evokes Tunisian culture even with thin context
+     ("dar zarrouk", "le bardo", "chez slah", "le sfax", "le djerba",
+      "el ali", "la mamma tunisienne" …)
+  3. Valid = false if the entity is a digital platform, app, or website
+     used to find or book restaurants — not a physical establishment itself
+  4. Valid = false if the entity is an internationally famous establishment
+     with NO Tunisian or North-African food context in the surrounding text
+     — the context is the deciding factor, not the name itself
+  5. Valid = false if context clearly describes a non-food entity
+     (mosque, museum, monument, mathematician, city name alone …)
+  6. When genuinely uncertain AND no Tunisian/Maghrebi signal → valid = false
 
 OUTPUT FORMAT — strict JSON object, no prose, no markdown:
 {
@@ -1900,6 +2036,11 @@ def compute_entity_features_global(
         model_presence_count = distinct_models
         cross_model_rate     = round(model_presence_count / total_models, 4)
 
+        # mention_prominence: % of mentions where entity is in top 3
+        mention_prominence = round(
+            sum(1 for r in valid_ranks if r <= 3) / mention_count, 4
+        ) if mention_count > 0 else 0.0
+
         rows.append({
             "canonical_entity":         entity,
             "mention_count":            mention_count,
@@ -1907,6 +2048,7 @@ def compute_entity_features_global(
             "average_ranking_position": avg_rank,
             "rank_variance":            rank_variance,
             "top1_rate":                top1_rate,
+            "mention_prominence":       mention_prominence,
             "frequency_across_runs":    group['run_id'].nunique(),
             "stability_score":          stability_score,
             "consistency_label":        consistency_label,
@@ -2011,10 +2153,11 @@ def agent1_compute_metrics(
           f"{len(df_global[df_global['consistency_label']=='variable'])}")
     print(f"   Unstable entities  : "
           f"{len(df_global[df_global['consistency_label']=='unstable'])}")
-    print(f"   Top 5 by stability :")
-    print(df_global[['canonical_entity', 'stability_score',
-                     'mention_rate', 'average_ranking_position',
-                     'cross_model_rate']].head(5).to_string(index=False))
+    print(f"   Top 5 by GEO Score :")
+    cols = ['canonical_entity', 'geo_score', 'mention_rate',
+            'mention_prominence', 'stability_score', 'cross_model_rate']
+    cols = [c for c in cols if c in df_global.columns]
+    print(df_global[cols].head(5).to_string(index=False))
     print(f"\n   ⚠ Running on partial data: {total_responses} valid responses")
     print(f"   Rates normalized to actual valid responses.")
     print(f"   Re-run after backfilling truncated responses.")
@@ -2054,7 +2197,8 @@ def run_agent1_node(state: PipelineState) -> PipelineState:
     try:
         # Step 2
         df_raw = agent1_query_prompts(
-            prompts=prompts, models=QUERY_MODELS,
+            prompts=prompts,
+            query_models=QUERY_MODELS,
             n_runs=N_RUNS, output_path=RAW_OUTPUT_PATH,
         )
         # Step 3

@@ -1,11 +1,22 @@
 ﻿prompt_id,intent_id,language,variant_id,prompt_text
-P001,restaurant_search,fr,1,Je cherche un restaurant tunisien à Paris
-P002,restaurant_search,fr,2,Restaurants tunisiens près de moi à Marseille
-P003,menu_inquiry,fr,1,Quels sont les plats typiques que vous proposez au restaurant?
-P004,menu_inquiry,fr,2,Pouvez-vous m'envoyer la carte du restaurant tunisien pour voir les prix?
-P005,reservation_booking,fr,1,Je voudrais réserver une table pour 4 personnes dans un restaurant tunisien pour ce soir
-P006,reservation_booking,fr,2,Pouvez-vous me faire une réservation au restaurant tunisien le plus proche pour demain à 20h
-P007,cuisine_exploration,fr,1,Quels sont les plats traditionnels tunisiens que je devrais essayer?
-P008,cuisine_exploration,fr,2,"Je cherche à découvrir la cuisine tunisienne, quels sont les ingrédients et les méthodes de cuisson les plus utilisés?"
-P009,review_and_rating,fr,1,Je cherche des avis sur les restaurants tunisiens à Paris
-P010,review_and_rating,fr,2,Noter et commenter mon expérience au restaurant tunisien le plus proche
+P001,top_recommendation,en,1,What's the top Tunisian restaurant in Tunis?
+P002,top_recommendation,en,2,List the top 3 Tunisian restaurants in Sousse
+P003,top_recommendation,en,3,What are the most famous Tunisian restaurants in Carthage?
+P004,cuisine_specific,en,1,What are the top 3 Tunisian restaurants in Tunis that serve the best seafood?
+P005,cuisine_specific,en,2,Can you list the most popular traditional Tunisian food places in the Medina of Tunis?
+P006,cuisine_specific,en,3,"What's the best place in Sousse for authentic Tunisian cuisine, specifically a restaurant known for its local dishes?"
+P007,neighborhood_query,en,1,What's the best Tunisian restaurant in the Medina of Tunis?
+P008,neighborhood_query,en,2,"List the top 3 Tunisian eateries in Carthage, Tunisia"
+P009,neighborhood_query,en,3,Cite the most popular Tunisian restaurants in Sousse's old town
+P010,price_range,en,1,What are the top 3 affordable Tunisian restaurants in Tunis?
+P011,price_range,en,2,List the best high-end Tunisian restaurants in Sousse
+P012,price_range,en,3,What are the most known budget-friendly Tunisian restaurants in the Medina of Tunis?
+P013,opening_hours,en,1,"What are the opening hours of the best Tunisian restaurant in Tunis, Le Grand Maghreb?"
+P014,opening_hours,en,2,Can you list the top 3 Tunisian restaurants in Hammamet and their opening hours?
+P015,opening_hours,en,3,"What are the opening hours of Dar Hi, one of the most famous Tunisian restaurants in Sousse?"
+P016,rating_review,en,1,What are the top rated Tunisian restaurants in Tunis?
+P017,rating_review,en,2,List the best Tunisian restaurants in Hammamet
+P018,rating_review,en,3,What are the most popular Tunisian restaurants in Sousse with high reviews?
+P019,event_booking,en,1,What's the top Tunisian restaurant in Tunis for hosting a wedding party?
+P020,event_booking,en,2,List the 3 best-known Tunisian restaurants in Hammamet that can accommodate a big event
+P021,event_booking,en,3,Cite the most popular Tunisian restaurant in Sousse for a birthday party
