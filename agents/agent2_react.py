@@ -61,13 +61,20 @@ MCP_SERVERS = {
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a GEO research agent. Collect REAL web data for a restaurant using tools. Never invent values — use null if a tool returns nothing.
+SYSTEM_PROMPT = """You are a GEO research agent. Collect REAL web data for a TUNISIAN restaurant. Never invent values — use null if a tool returns nothing.
+
+CRITICAL RULE — TUNISIA ONLY:
+- You are researching restaurants located in TUNISIA (North Africa).
+- Always include "Tunisia" or a Tunisian city (Tunis, Sfax, Sousse, Djerba, Hammamet, Nabeul, Bizerte, Kairouan) in every search query.
+- If a result shows a country other than Tunisia (e.g. France, Morocco, Spain, Italy, Nicaragua) — DISCARD it and search again with more specific Tunisian location terms.
+- If wikidata_lookup returns wd_country != Tunisia/Tunisie — set wd_country=null and wd_entity_type=null (wrong entity).
+- If tripadvisor_search returns a URL for a non-Tunisian city — discard and try again with the Tunisian city name.
 
 STEPS (in order):
 1. google_maps_search(entity, location="Tunisia")
-2. wikipedia_lookup(entity)
+2. wikipedia_lookup(entity + " Tunisia")
 3. tripadvisor_search(entity, location="Tunisia")
-4. wikidata_lookup(entity)
+4. wikidata_lookup(entity + " Tunisia")
 5. If website found in step 1: extract_website_socials(website_url)
 6. If ig_handle found: scrape_instagram(handle)
 7. If fb_handle found: scrape_facebook(handle)
@@ -128,6 +135,12 @@ def _load_done() -> set:
     try:
         import pandas as pd
         df = pd.read_csv(CHECKPOINT_FILE)
+        # Only count rows that were successfully enriched (confidence > 0, no error)
+        if "overall_confidence" in df.columns:
+            mask = df["overall_confidence"].fillna(0) > 0
+            if "error" in df.columns:
+                mask = mask & df["error"].isna()
+            df = df[mask]
         return set(df["canonical_entity"].dropna().str.lower().tolist())
     except Exception:
         return set()
@@ -320,30 +333,23 @@ def _make_llm(model_id: str, provider: str, api_key: str = ""):
 
 
 # Models known to support tool calling — in priority order.
-# :free OpenRouter models are EXCLUDED — their 8 req/min RPM breaks parallel batches.
-# Groq → Mistral (free, reliable) → OpenRouter paid only.
+# Groq first (fastest, highest quality), then OpenRouter as fallback.
+# Registry skips TPD-exhausted slots automatically — no hardcoded provider skip.
 _TOOL_CAPABLE = [
-    # 1. Groq (fast, free daily quota)
-    "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
-    # 2. Mistral direct API (free tier, tool-capable, no RPM issues)
-    "mistral-small-latest",
-    "mistral-medium-latest",
-    # 3. OpenRouter PAID only (no :free models — RPM too restrictive)
-    "meta-llama/llama-3.3-70b-instruct",
-    "mistralai/mistral-small",
-    "mistralai/mistral-medium",
-    "anthropic/claude-3-haiku",
-    "openai/gpt-4o-mini",
-    "google/gemini-flash-1.5",
+    "llama-3.3-70b-versatile",              # Groq  — priority 1
+    "meta-llama/llama-3.3-70b-instruct",    # OpenRouter — priority 2
+    "mistralai/mistral-small",              # OpenRouter
+    "mistralai/mistral-medium",             # OpenRouter
+    "anthropic/claude-3-haiku",             # OpenRouter
+    "openai/gpt-4o-mini",                   # OpenRouter
+    "google/gemini-flash-1.5",              # OpenRouter
+    "qwen/qwen3-32b",                       # OpenRouter
 ]
 
 def _batch_size(provider: str) -> int:
-    if provider == "groq":
-        return 4
-    if provider == "mistral":
-        return 2
-    return 1  # OpenRouter paid — sequential to avoid RPM surprises
+    # All providers run sequentially (batch=1) to avoid TPM/RPM rate limits.
+    # Groq TPM=12k/min, parallel batches multiply token usage and cause 429s.
+    return 1
 
 
 async def _research_one(entity: str, tools: list,
@@ -390,16 +396,24 @@ async def _research_one(entity: str, tools: list,
             )
             action = decision["action"]
 
+            # Mark exhausted BEFORE switching so registry skips it immediately
             if decision.get("mark_exhausted"):
                 _registry.mark_tpd_exhausted(current_model, current_provider, current_api_key)
+                attempt -= 1  # exhaustion switch is free — don't burn an attempt
 
             if action == "switch_model":
-                # Try tool-capable models in priority order
+                # Iterate _TOOL_CAPABLE; registry.select() naturally skips exhausted
+                # slots. No provider is hardcoded — the system self-heals by exhausting
+                # each model in turn until one works.
                 switched = False
                 for cap_model in _TOOL_CAPABLE:
                     try:
-                        current_model, current_provider, current_api_key = \
-                            _registry.select(preferred=cap_model)
+                        m_id, m_prov, m_key = _registry.select(preferred=cap_model)
+                        if m_id not in _TOOL_CAPABLE:
+                            continue  # registry gave a random fallback — skip
+                        if m_id == current_model and m_prov == current_provider:
+                            continue  # skip the model that just failed
+                        current_model, current_provider, current_api_key = m_id, m_prov, m_key
                         llm   = _make_llm(current_model, current_provider, current_api_key)
                         agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
                         print(f"[{idx}/{total}] Supervisor: switched to "
@@ -408,16 +422,15 @@ async def _research_one(entity: str, tools: list,
                         break
                     except RuntimeError:
                         continue
-                if not switched:
-                    row = {"canonical_entity": entity, "error": err_msg[:300],
-                           "overall_confidence": 0.0}
+                # if not switched: no model available right now — loop continues,
+                # next attempt will retry; eventually hits attempt >= 6 and exits.
 
             elif action == "wait_retry":
                 wait = float(decision.get("wait_seconds") or 10)
                 _registry.mark_tpm(current_model, current_provider, wait, current_api_key)
                 print(f"[{idx}/{total}] Supervisor: waiting {wait:.0f}s then retrying")
                 await asyncio.sleep(wait + 1)
-                attempt -= 1  # don't count wait-retries against attempt limit
+                attempt -= 1  # RPM wait is free — don't burn an attempt
 
             elif action == "retry":
                 wait = float(decision.get("wait_seconds") or 0)
@@ -486,8 +499,33 @@ async def _research_all_async(entities: list[str], initial_model: str,
             )
             for i, entity in enumerate(batch)
         ]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=False)
-        results.extend(batch_results)
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        connection_errors = []
+        for i, res in enumerate(batch_results):
+            if isinstance(res, Exception):
+                ent_name = batch[i] if i < len(batch) else "unknown"
+                err_str  = str(res)
+                print(f"[Agent2] Unhandled exception for '{ent_name}': {err_str[:120]}")
+                if "connection" in err_str.lower() or "connect" in err_str.lower():
+                    connection_errors.append((i, ent_name))
+                error_row = {"canonical_entity": ent_name, "error": err_str[:300],
+                             "overall_confidence": 0.0}
+                _save_row(error_row)
+                results.append(error_row)
+            else:
+                results.append(res)
+
+        # If connection errors occurred, force MCP reconnect before next batch
+        if connection_errors:
+            print(f"[Agent2] {len(connection_errors)} connection error(s) — "
+                  f"forcing MCP reconnect before next batch")
+            try:
+                mcp_client = MultiServerMCPClient(MCP_SERVERS)
+                tools = await mcp_client.get_tools()
+            except Exception as e:
+                print(f"[Agent2] MCP reconnect failed: {e}")
+                tools = None
+
         batch_start += bsize
 
     return results
@@ -513,11 +551,16 @@ def run_agent2_react(entities: list[str], fresh_start: bool = False) -> list[dic
         import pandas as pd
         return pd.read_csv(CHECKPOINT_FILE).to_dict(orient="records")
 
-    # Select initial model — try tool-capable models in priority order
+    # Select initial model — try tool-capable models in priority order.
+    # Select first available tool-capable model. Registry skips TPD-exhausted slots
+    # automatically — no provider is hardcoded here. The supervisor handles switching.
     model_id, provider, api_key = None, None, None
     for cap_model in _TOOL_CAPABLE:
         try:
-            model_id, provider, api_key = _registry.select(preferred=cap_model)
+            m_id, m_prov, m_key = _registry.select(preferred=cap_model)
+            if m_id not in _TOOL_CAPABLE:
+                continue  # registry returned a random fallback — skip
+            model_id, provider, api_key = m_id, m_prov, m_key
             break
         except RuntimeError:
             continue

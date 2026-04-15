@@ -76,7 +76,7 @@ class SupervisorAgent:
         return self._llm
 
     def _llm_decide(self, error_message: str, model_id: str,
-                    provider: str, attempt: int) -> dict:
+                    provider: str, attempt: int, entity: str = "") -> dict:
         """Call the LLM to reason about the error and return a decision."""
         llm_info = self._get_llm()
         if llm_info is None:
@@ -132,17 +132,32 @@ class SupervisorAgent:
             print(f"[supervisor] LLM reasoning failed ({e}) — falling back to rule-based")
 
         # Fallback: rule-based decision if LLM fails
-        return self._rule_based_decide(error_message, attempt)
+        return self._rule_based_decide(error_message, attempt, entity)
 
-    def _rule_based_decide(self, error_message: str, attempt: int) -> dict:
+    def _rule_based_decide(self, error_message: str, attempt: int,
+                           entity: str = "") -> dict:
         """Deterministic fallback — mirrors original if/elif logic."""
         msg = error_message.lower()
 
-        # RPM (requests per minute) — always wait+retry, never count against attempt limit
+        # TPD / daily quota — check BEFORE RPM so per-day errors don't get misclassified
+        if ("tokens per day" in msg or "per-day" in msg
+                or "free-models-per-day" in msg or "402" in msg
+                or "requires more credits" in msg or "can only afford" in msg):
+            return {"action": "switch_model", "mark_exhausted": True,
+                    "wait_seconds": 0, "reason": "daily quota or billing exhausted"}
+
+        # RPM (requests per minute) — wait+retry, but cap consecutive RPM waits
         if "429" in msg and any(kw in msg for kw in (
                 "limit_rpm", "requests per minute", "free-models-per-min",
                 "rate limit exceeded", "temporarily rate-limited", "retry shortly")):
-            # Extract wait time if given, default 10s for RPM
+            # Count consecutive RPM errors for this entity
+            history = self._failure_history.get(entity, [])
+            rpm_streak = sum(1 for e in history[-6:] if "free-models-per-min" in e.lower()
+                             or "requests per minute" in e.lower())
+            if rpm_streak >= 5:
+                # Stuck in RPM loop — switch model instead of waiting forever
+                return {"action": "switch_model", "mark_exhausted": False,
+                        "wait_seconds": 0, "reason": f"RPM loop detected ({rpm_streak} consecutive) — switching model"}
             m = re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)s", error_message)
             wait = (int(m.group(1) or 0) * 60 + float(m.group(2))) if m else 10
             return {"action": "wait_retry", "mark_exhausted": False,
@@ -169,11 +184,12 @@ class SupervisorAgent:
             return {"action": "switch_model", "mark_exhausted": True,
                     "wait_seconds": 0, "reason": "413 TPM budget too small"}
 
-        # TPD / billing
-        if ("tokens per day" in msg or "daily" in msg or "402" in msg
-                or "requires more credits" in msg or "can only afford" in msg):
-            return {"action": "switch_model", "mark_exhausted": True,
-                    "wait_seconds": 0, "reason": "daily quota or billing exhausted"}
+        # TPM rate limit — extract wait time
+        if "429" in msg and ("tokens per minute" in msg or "tpm" in msg):
+            m = re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)s", error_message)
+            wait = (int(m.group(1) or 0) * 60 + float(m.group(2))) if m else 30
+            return {"action": "wait_retry", "mark_exhausted": False,
+                    "wait_seconds": wait, "reason": f"TPM rate limit — wait {wait:.0f}s"}
 
         # TPM rate limit — extract wait time
         if "429" in msg and ("tokens per minute" in msg or "tpm" in msg
@@ -210,7 +226,7 @@ class SupervisorAgent:
             return {"action": "skip", "mark_exhausted": False,
                     "wait_seconds": 0, "reason": "max attempts (4) reached"}
 
-        decision = self._llm_decide(error_message, model_id, provider, attempt)
+        decision = self._llm_decide(error_message, model_id, provider, attempt, entity)
 
         print(f"[supervisor] {entity} | attempt {attempt} | "
               f"action={decision['action']} | {decision['reason']}")

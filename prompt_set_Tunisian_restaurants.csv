@@ -1,22 +1,31 @@
-﻿prompt_id,intent_id,language,variant_id,prompt_text
-P001,top_recommendation,en,1,What's the top Tunisian restaurant in Tunis?
-P002,top_recommendation,en,2,List the top 3 Tunisian restaurants in Sousse
-P003,top_recommendation,en,3,What are the most famous Tunisian restaurants in Carthage?
-P004,cuisine_specific,en,1,What are the top 3 Tunisian restaurants in Tunis that serve the best seafood?
-P005,cuisine_specific,en,2,Can you list the most popular traditional Tunisian food places in the Medina of Tunis?
-P006,cuisine_specific,en,3,"What's the best place in Sousse for authentic Tunisian cuisine, specifically a restaurant known for its local dishes?"
-P007,neighborhood_query,en,1,What's the best Tunisian restaurant in the Medina of Tunis?
-P008,neighborhood_query,en,2,"List the top 3 Tunisian eateries in Carthage, Tunisia"
-P009,neighborhood_query,en,3,Cite the most popular Tunisian restaurants in Sousse's old town
-P010,price_range,en,1,What are the top 3 affordable Tunisian restaurants in Tunis?
-P011,price_range,en,2,List the best high-end Tunisian restaurants in Sousse
-P012,price_range,en,3,What are the most known budget-friendly Tunisian restaurants in the Medina of Tunis?
-P013,opening_hours,en,1,"What are the opening hours of the best Tunisian restaurant in Tunis, Le Grand Maghreb?"
-P014,opening_hours,en,2,Can you list the top 3 Tunisian restaurants in Hammamet and their opening hours?
-P015,opening_hours,en,3,"What are the opening hours of Dar Hi, one of the most famous Tunisian restaurants in Sousse?"
-P016,rating_review,en,1,What are the top rated Tunisian restaurants in Tunis?
-P017,rating_review,en,2,List the best Tunisian restaurants in Hammamet
-P018,rating_review,en,3,What are the most popular Tunisian restaurants in Sousse with high reviews?
-P019,event_booking,en,1,What's the top Tunisian restaurant in Tunis for hosting a wedding party?
-P020,event_booking,en,2,List the 3 best-known Tunisian restaurants in Hammamet that can accommodate a big event
-P021,event_booking,en,3,Cite the most popular Tunisian restaurant in Sousse for a birthday party
+﻿"prompt_id","intent_id","language","variant_id","prompt_text"
+"P001","top_recommendation","fr","1","Quel est le meilleur restaurant tunisien a Tunis ?"
+"P002","top_recommendation","fr","2","Cite-moi les 3 restaurants tunisiens les plus reputes a Tunis."
+"P003","top_recommendation","fr","3","Quel restaurant tunisien est incontournable a Sousse ?"
+"P004","top_recommendation","fr","4","Quels sont les restaurants les plus connus de Sfax ?"
+"P005","top_recommendation","fr","5","Recommande-moi le meilleur restaurant traditionnel tunisien a Hammamet."
+"P006","cuisine_authentique","fr","1","Quel restaurant est repute pour son couscous authentique a Tunis ?"
+"P007","cuisine_authentique","fr","2","Ou manger le meilleur brik a Tunis ?"
+"P008","cuisine_authentique","fr","3","Quel restaurant de Sousse est connu pour sa cuisine tunisienne traditionnelle ?"
+"P009","cuisine_authentique","fr","4","Cite-moi un restaurant a Sfax repute pour ses plats regionaux."
+"P010","cuisine_authentique","fr","5","Ou trouver la meilleure chakchouka maison a Tunis ?"
+"P011","localisation","fr","1","Quels restaurants recommandes-tu dans le quartier La Marsa a Tunis ?"
+"P012","localisation","fr","2","Quels sont les meilleurs restaurants du centre-ville de Sousse ?"
+"P013","localisation","fr","3","Cite-moi les restaurants incontournables de la medina de Tunis."
+"P014","localisation","fr","4","Quels restaurants sont les plus populaires a Sidi Bou Said ?"
+"P015","localisation","fr","5","Ou manger dans le quartier historique de Sfax ?"
+"P016","occasion_speciale","fr","1","Quel restaurant pour un diner romantique a Tunis ?"
+"P017","occasion_speciale","fr","2","Recommande-moi un restaurant pour un repas d affaires a Tunis."
+"P018","occasion_speciale","fr","3","Quel est le meilleur restaurant pour un anniversaire a Sousse ?"
+"P019","occasion_speciale","fr","4","Ou celebrer un evenement familial dans un cadre authentique a Monastir ?"
+"P020","occasion_speciale","fr","5","Quel restaurant haut de gamme recommandes-tu pour une occasion speciale a Djerba ?"
+"P021","comparatif","fr","1","Classe les 5 meilleurs restaurants tunisiens a Tunis."
+"P022","comparatif","fr","2","Quels sont les restaurants tunisiens les mieux notes a Sousse selon toi ?"
+"P023","comparatif","fr","3","Compare les meilleurs restaurants de Tunis et de Sousse."
+"P024","comparatif","fr","4","Quel restaurant tunisien offre le meilleur rapport qualite-prix a Sfax ?"
+"P025","comparatif","fr","5","Cite les 3 restaurants les plus reputes de Djerba en les classant."
+"P026","avis_touristes","fr","1","Je suis touriste a Tunis quel restaurant me recommandes-tu ?"
+"P027","avis_touristes","fr","2","Quels restaurants tunisiens sont les plus apprecies par les touristes a Sousse ?"
+"P028","avis_touristes","fr","3","En tant que visiteur a Hammamet ou dois-je absolument manger ?"
+"P029","avis_touristes","fr","4","Quel restaurant est le plus mentionne par les touristes etrangers a Tunis ?"
+"P030","avis_touristes","fr","5","Je visite Djerba pour la premiere fois quel restaurant local recommandes-tu ?"

@@ -71,8 +71,8 @@ from config import QUERY_MODELS as QUERY_MODELS
 MODEL_EXTRACTOR       ="mistral-small-latest" #"llama-3.3-70b-versatile"
 MODEL_EXTRACTOR2      ="llama-3.3-70b-versatile"
 MODEL_EXTRACTOR3      ="llama-3.1-8b-instant"
-MODEL_ANALYST         = "llama-3.3-70b-versatile"
-MODEL_ANALYST2         = "llama-3.3-70b-versatile"
+MODEL_ANALYST         = "mistral-small-latest"
+MODEL_ANALYST2        = "mistral-small-latest"
 MODEL_FALLBACK_HEAVY  = "qwen/qwen3-32b"
 
 from config import N_RUNS
@@ -363,20 +363,42 @@ def agent1_query_prompts(
     if query_models is None:
         query_models = QUERY_MODELS
 
+    # Column schema — must match the record dict keys below
+    _RAW_COLS = ["response_id","prompt_id","model_slot","model_id","provider",
+                 "run_id","response_text","completion_tokens","prompt_tokens",
+                 "total_tokens","timestamp"]
+
     # resume support — key is (prompt_id, slot, run_id)
     done_keys = set()
-    if os.path.exists(output_path):
-        df_existing = pd.read_csv(
-            output_path, encoding='utf-8-sig', quoting=csv.QUOTE_ALL
+    file_has_data = os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    if file_has_data:
+        try:
+            df_existing = pd.read_csv(output_path, encoding='utf-8-sig')
+            if 'prompt_id' in df_existing.columns:
+                for _, row in df_existing.iterrows():
+                    done_keys.add((row['prompt_id'], str(row.get('model_slot', row.get('model_id',''))), row['run_id']))
+                print(f"Resuming - {len(done_keys)} records already saved")
+            else:
+                # File exists but has corrupted/missing header — start fresh
+                print(f"[WARN] {output_path} has no valid header — rewriting")
+                os.remove(output_path)
+                file_has_data = False
+        except Exception as e:
+            print(f"[WARN] Could not read {output_path}: {e} — rewriting")
+            os.remove(output_path)
+            file_has_data = False
+
+    # Write header row explicitly if file is new/empty
+    if not file_has_data:
+        pd.DataFrame(columns=_RAW_COLS).to_csv(
+            output_path, mode='w', index=False,
+            encoding='utf-8-sig', quoting=csv.QUOTE_ALL
         )
-        for _, row in df_existing.iterrows():
-            done_keys.add((row['prompt_id'], str(row.get('model_slot', row['model_id'])), row['run_id']))
-        print(f"Resuming - {len(done_keys)} records already saved")
 
     total_prompts  = len(prompts)
     total_calls    = total_prompts * len(query_models) * n_runs
     done_calls     = len(done_keys)
-    header_written = os.path.exists(output_path)
+    header_written = True  # always True now — header pre-written above
 
     slot_names = [s["slot"] if isinstance(s, dict) else s for s in query_models]
     print(f"\nStep 2: LLM querying (multi-model, multi-run)")
@@ -783,15 +805,27 @@ def agent1_extract_entities(
     """
 
     # resume support
+    _ENTITY_COLS = ["entity_id", "response_id", "entity", "brand_raw_text"]
     done_response_ids = set()
-    if os.path.exists(output_path):
-        df_existing = pd.read_csv(
-            output_path, encoding='utf-8-sig', quoting=csv.QUOTE_ALL
-        )
-        done_response_ids = set(df_existing['response_id'].unique())
-        print(f"Resuming - {len(done_response_ids)} responses already extracted")
+    file_has_data = os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    if file_has_data:
+        try:
+            df_existing = pd.read_csv(output_path, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if 'response_id' in df_existing.columns:
+                done_response_ids = set(df_existing['response_id'].unique())
+                print(f"Resuming - {len(done_response_ids)} responses already extracted")
+            else:
+                os.remove(output_path)
+                file_has_data = False
+        except Exception:
+            os.remove(output_path)
+            file_has_data = False
 
-    header_written = os.path.exists(output_path)
+    if not file_has_data:
+        pd.DataFrame(columns=_ENTITY_COLS).to_csv(
+            output_path, mode='w', index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL
+        )
+
     total = len(df_raw)
 
     print(f"\nStep 3: Entity extraction")
@@ -854,12 +888,11 @@ def agent1_extract_entities(
             pd.DataFrame(records).to_csv(
                 output_path,
                 mode='a',
-                header=not header_written,
+                header=False,
                 index=False,
                 encoding='utf-8-sig',
                 quoting=csv.QUOTE_ALL
             )
-            header_written = True
 
         done_response_ids.add(response_id)
 
@@ -1025,13 +1058,27 @@ def agent1_enrich_entities(
     )
 
     # resume support
+    _ENRICH_COLS = ["response_id", "prompt_id", "entity", "run_id",
+                    "ranking_position", "description_length_tokens"]
     done_response_ids = set()
-    if os.path.exists(output_path):
-        df_existing = pd.read_csv(output_path, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
-        done_response_ids = set(df_existing["response_id"].unique())
-        print(f"Resuming — {len(done_response_ids)} responses already done")
+    file_has_data = os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    if file_has_data:
+        try:
+            df_existing = pd.read_csv(output_path, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
+            if "response_id" in df_existing.columns:
+                done_response_ids = set(df_existing["response_id"].unique())
+                print(f"Resuming — {len(done_response_ids)} responses already done")
+            else:
+                os.remove(output_path)
+                file_has_data = False
+        except Exception:
+            os.remove(output_path)
+            file_has_data = False
 
-    header_written = os.path.exists(output_path)
+    if not file_has_data:
+        pd.DataFrame(columns=_ENRICH_COLS).to_csv(
+            output_path, mode="w", index=False, encoding="utf-8-sig", quoting=csv.QUOTE_ALL
+        )
 
     # PHASE A — ranking extraction
     print("\nPhase A — Ranking extraction per response")
@@ -1102,7 +1149,7 @@ def agent1_enrich_entities(
         pd.DataFrame(records).to_csv(
             output_path,
             mode="a",
-            header=not header_written,
+            header=False,
             index=False,
             encoding="utf-8-sig",
             quoting=csv.QUOTE_ALL
@@ -1131,6 +1178,7 @@ import csv
 import json
 import re
 import time
+import unicodedata
 import pandas as pd
 from rapidfuzz import fuzz, process
 
@@ -1142,29 +1190,46 @@ FUZZY_AMBIG_LOWER     = 75
 FUZZY_AMBIG_UPPER     = 87
 MIN_ENTITY_LENGTH     = 3
 NULL_RANK_PENALTY     = 999
+MIN_MENTION_COUNT     = 2          # drop singletons — noise, not signal
+
+
+def normalize_name(e: str) -> str:
+    """
+    Canonical normalization for entity comparison:
+    strip → lower → NFD decompose → strip combining marks (accents).
+    'Café des Nattes' and 'cafe des nattes' both → 'cafe des nattes'.
+    """
+    e = str(e).strip().lower()
+    e = unicodedata.normalize("NFD", e)
+    e = "".join(c for c in e if unicodedata.category(c) != "Mn")
+    return e
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE A — Hard rules only
 # ══════════════════════════════════════════════════════════════════════════════
 
-def phase_a_prefilter(df: pd.DataFrame) -> tuple:
+def phase_a_prefilter(df: pd.DataFrame, entity_counts: dict) -> tuple:
     """
-    Hard drop only — empty, numeric, too short.
-    No domain lists — LLM handles semantic validation in Phase C.
+    Hard drop — empty, numeric, too short, non-Tunisian, generic names,
+    and singletons (mention count < MIN_MENTION_COUNT).
+    entity_counts keys must already be normalized via normalize_name().
     """
     log = []
     df  = df.copy()
     df['quality_flag'] = 'ok'
 
     def hard_invalid(entity: str) -> str:
-        e = str(entity).strip().lower()
-        if not e:
+        raw = str(entity).strip()
+        if not raw:
             return "empty"
+        e = normalize_name(raw)
         if len(e) < MIN_ENTITY_LENGTH:
             return "too_short"
         if e.isdigit():
             return "numeric"
+        if entity_counts.get(e, 0) < MIN_MENTION_COUNT:
+            return "singleton"
         return None
 
     drop_mask = pd.Series([False] * len(df), index=df.index)
@@ -1201,7 +1266,7 @@ def phase_b_fuzzy_cluster(
     Fuzzy deduplication using token_sort_ratio.
     Canonical = most frequent entity in cluster.
     """
-    entities    = sorted(set(e.strip().lower() for e in entities if e))
+    entities    = sorted(set(normalize_name(e) for e in entities if e))
     assigned    = {}
     clusters    = {}
     pair_scores = {}
@@ -1245,47 +1310,78 @@ def phase_b_fuzzy_cluster(
 
 ARBITRATION_SYSTEM = """\
 You are an entity resolution and validation specialist for a restaurant
-GEO analysis pipeline studying TUNISIAN restaurants — establishments
-serving Tunisian / North-African cuisine, or restaurants located in Tunisia.
+GEO analysis pipeline. The domain is TUNISIAN restaurants — physical
+establishments serving Tunisian / North-African cuisine, OR restaurants
+physically located in Tunisia.
 
-You have TWO tasks:
+You have TWO tasks.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TASK 1 — PAIR RESOLUTION
-Decide if each pair refers to the SAME physical restaurant or DIFFERENT.
-Be CONSERVATIVE — when in doubt return DIFFERENT.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Decide if each pair refers to the SAME physical place or DIFFERENT places.
+Default: DIFFERENT. Flip to SAME only for pure surface variants.
 
-SAME only when:
-  - Pure spelling or article variant of identical place
-      kasbah / casbah                  -> SAME
-      el kasbah / la kasbah            -> SAME
-      le corsaire / corsaire           -> SAME
-      restaurant rami / rami           -> SAME
-DIFFERENT when:
-  - Any meaningful word differs
-  - Different proper nouns even if similar theme
-  - Any genuine doubt                  -> DIFFERENT
+SAME — only for:
+  • Accent/spelling variant of identical name
+      cafe des nattes / café des nattes         -> SAME
+  • Article swap with no new word
+      el kasbah / la kasbah / kasbah            -> SAME
+      le corsaire / corsaire                    -> SAME
+  • Generic prefix that adds nothing
+      restaurant dar zarrouk / dar zarrouk      -> SAME
 
+DIFFERENT — always when:
+  • Any substantive word differs (even one letter in a proper noun)
+      dar el jedid / dar el jeld                -> DIFFERENT (distinct places)
+  • Different city/neighbourhood qualifier
+  • Any genuine doubt                           -> DIFFERENT
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TASK 2 — ENTITY VALIDATION
-For each entity and its context, decide if it is a real Tunisian /
-North-African restaurant, cafe, or food business.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+For each entity decide: is it a real, SPECIFIC, identifiable Tunisian or
+North-African restaurant / café / food establishment?
 
-VALIDATION RULES (apply in order):
-  1. Valid = true  if context clearly mentions Tunisian or North-African
-     food culture (couscous, brik, harissa, tajine, merguez, lablabi,
-     malouf, Tunisian, Maghrebi, North African, Carthage, Medina …)
-  2. Valid = true  if the name evokes Tunisian culture even with thin context
-     ("dar zarrouk", "le bardo", "chez slah", "le sfax", "le djerba",
-      "el ali", "la mamma tunisienne" …)
-  3. Valid = false if the entity is a digital platform, app, or website
-     used to find or book restaurants — not a physical establishment itself
-  4. Valid = false if the entity is an internationally famous establishment
-     with NO Tunisian or North-African food context in the surrounding text
-     — the context is the deciding factor, not the name itself
-  5. Valid = false if context clearly describes a non-food entity
-     (mosque, museum, monument, mathematician, city name alone …)
-  6. When genuinely uncertain AND no Tunisian/Maghrebi signal → valid = false
+REJECT (valid = false) when ANY of these apply:
 
-OUTPUT FORMAT — strict JSON object, no prose, no markdown:
+  R1. NOT A SPECIFIC PLACE — the name is a generic descriptor that could
+      refer to dozens of different restaurants and cannot identify one
+      physical establishment. Reject aggressively:
+        "la medina", "le jardin", "la kasbah", "la terrasse", "le patio",
+        "le palais", "la cour", "le bistro", "le grill", "le snack",
+        "restaurant tunisien", "cuisine tunisienne", "le restaurant" → REJECT
+
+  R2. WRONG GEOGRAPHY — the entity is a well-known restaurant from another
+      country with no Tunisian / North-African connection in the context.
+      Examples that MUST be rejected:
+        "le grand vefour" (Paris), "tour d argent" (Paris),
+        "noma" (Copenhagen), "el bulli" (Spain), "nobu" (global chain)
+      Apply this rule broadly — if the name is internationally famous
+      outside Tunisia and the context has no Tunisian signal → REJECT.
+
+  R3. NOT A FOOD BUSINESS — digital platform, booking app, monument,
+      museum, mosque, city name alone, mathematician, historical figure.
+
+  R4. NO SIGNAL — context provides no Tunisian / Maghrebi / North-African
+      food signal AND the name alone does not evoke Tunisian culture → REJECT.
+
+ACCEPT (valid = true) when:
+  A1. Context explicitly mentions Tunisian / North-African food culture:
+      couscous, brik, harissa, lablabi, merguez, malouf, tajine, fricassé,
+      Tunisian, Maghrebi, Carthage, medina of Tunis, Djerba, Sfax, Sousse …
+  A2. Name clearly evokes Tunisian culture even with thin context:
+      "dar zarrouk", "chez slah", "le sfax", "le djerba", "el ali",
+      "dar el jeld", "dar ben gacem", "la mamma tunisienne" …
+  A3. Name contains Tunisian proper nouns / Arabic restaurant naming
+      patterns AND context does not contradict Tunisian origin.
+
+BIAS: When uncertain, REJECT. A false negative (missed restaurant) is
+      preferable to a false positive (non-Tunisian entity in the output).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT — strict JSON, no prose, no markdown:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {
   "pair_resolutions": [
     {
@@ -1299,13 +1395,13 @@ OUTPUT FORMAT — strict JSON object, no prose, no markdown:
     {
       "entity": "entity_name",
       "valid" : true | false,
-      "reason": "brief explanation"
+      "reason": "R1|R2|R3|R4|A1|A2|A3 — one sentence"
     }
   ]
 }
 
-If no pairs to resolve: "pair_resolutions": []
-If no entities to validate: "entity_validations": []
+If no pairs: "pair_resolutions": []
+If no entities: "entity_validations": []
 """
 
 
@@ -1611,7 +1707,11 @@ def agent1_clean_entities(
     print(f"{'='*55}\n")
 
     cleaning_log  = []
-    entity_counts = df_enriched['entity'].value_counts().to_dict()
+    # Normalize keys so accent variants are counted together
+    entity_counts: dict = {}
+    for raw_entity in df_enriched['entity'].dropna():
+        key = normalize_name(str(raw_entity))
+        entity_counts[key] = entity_counts.get(key, 0) + 1
 
     # build entity context from brand_raw_text (extracted entities)
     # brand_raw_text is the specific description block for this entity
@@ -1644,16 +1744,16 @@ def agent1_clean_entities(
 
     # Phase A
     print("Phase A — Hard pre-filter")
-    df_filtered, log_a = phase_a_prefilter(df_enriched)
+    df_filtered, log_a = phase_a_prefilter(df_enriched, entity_counts)
     cleaning_log.extend(log_a)
 
     # Phase B
     print("\nPhase B — Fuzzy clustering")
-    all_entities = (
-        df_filtered['entity']
-        .dropna().str.strip().str.lower()
-        .unique().tolist()
-    )
+    all_entities = list({
+        normalize_name(e)
+        for e in df_filtered['entity'].dropna()
+        if normalize_name(str(e))
+    })
 
     clusters, pair_scores, canonical_map = phase_b_fuzzy_cluster(
         entities      = all_entities,

@@ -88,27 +88,38 @@ Always respond in valid JSON only, no explanation, no markdown."""
     all_prompts = []
 
     for intent in intents:
+        lang_instruction = "\n".join(
+            f'- For language "{lang}": write the prompt_text IN {lang.upper()} (e.g. French for "fr", Arabic for "ar", English for "en")'
+            for lang in languages
+        )
+
         prompt = f"""Domain: {domain}
 Intent: {intent['intent_name']} — {intent['description']}
-Languages: {languages}
+Target languages: {languages}
 Number of variants per language: {n_variants}
 
-Generate {n_variants} natural user queries for EACH of these languages: {languages}
+Generate exactly {n_variants} natural user queries for EACH of these languages: {languages}
+Total expected: {n_variants * len(languages)} items.
 
-Queries must:
-- Sound like real user input, not formal questions
-- Be phrased to elicit SPECIFIC establishment names (use superlatives, rankings, "cite", "liste", "le meilleur", "les plus connus")
-- Be geographically precise (name a city or neighbourhood, not just "Tunisie" generically)
-- Be diverse in phrasing and structure
-- Stay within the domain and intent
+LANGUAGE RULES — CRITICAL:
+{lang_instruction}
+The prompt_text MUST be written IN the specified language, NOT in English.
+Example for "fr": "Quel est le meilleur restaurant tunisien à Tunis ?" (French text)
+Example for "ar": "ما هو أفضل مطعم تونسي في تونس؟" (Arabic text)
 
-Respond ONLY with a JSON array like:
+Each query must:
+- Sound like a real user typing into a chatbot
+- Force the AI to name SPECIFIC known establishments (use "le meilleur", "cite-moi", "les 3 plus connus", "quel restaurant", etc.)
+- Name a specific Tunisian city (Tunis, Sousse, Sfax, Hammamet, Monastir, Djerba, Sidi Bou Said...)
+- Be diverse in phrasing from other variants
+
+Respond ONLY with a JSON array:
 [
   {{
     "intent_id": "{intent['intent_id']}",
     "language": "fr",
     "variant_id": 1,
-    "prompt_text": "..."
+    "prompt_text": "Quel est le meilleur restaurant tunisien à Tunis ?"
   }}
 ]"""
 
@@ -248,7 +259,8 @@ def agent0_run(domain: str, model: str, languages: list = ["fr", "ar"],
         print(f"\n Agent 0 reached max loops - saving best available output")
 
     output_path = f"prompt_set_{domain.replace(' ', '_')}.csv"
-    prompt_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+    if not os.path.exists(output_path):  # never overwrite a pre-built prompt set
+        prompt_df.to_csv(output_path, index=False, encoding='utf-8-sig')
     print(f"\n Agent 0 complete - {len(prompt_df)} prompts -> '{output_path}'")
     return prompt_df
 
@@ -262,14 +274,20 @@ def run_agent0_node(state: PipelineState) -> PipelineState:
     """LangGraph node: runs Agent 0 and merges results into state."""
     errors = list(state.get("errors", []))
     try:
-        prompt_df = agent0_run(
-            domain               = state["domain"],
-            model                = MODEL_1,
-            languages            = state.get("languages", ["fr"]),
-            n_intents            = state.get("n_intents", 4),
-            n_variants           = state.get("n_variants", 3),
-            max_reflection_loops = state.get("max_reflection_loops", 2),
-        )
+        # If a pre-built prompt set exists, load it directly instead of regenerating
+        output_path = f"prompt_set_{state['domain'].replace(' ', '_')}.csv"
+        if os.path.exists(output_path):
+            prompt_df = pd.read_csv(output_path, encoding='utf-8-sig')
+            print(f"\n Agent 0: loaded existing prompt set ({len(prompt_df)} prompts) from '{output_path}'")
+        else:
+            prompt_df = agent0_run(
+                domain               = state["domain"],
+                model                = MODEL_1,
+                languages            = state.get("languages", ["fr"]),
+                n_intents            = state.get("n_intents", 4),
+                n_variants           = state.get("n_variants", 3),
+                max_reflection_loops = state.get("max_reflection_loops", 2),
+            )
         prompt_set = prompt_df.to_dict(orient="records")
     except Exception as exc:
         errors.append(f"agent0: {exc}")

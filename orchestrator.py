@@ -20,6 +20,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from llm_utils import call_llm_json
+from config import CHECKPOINT_FILE
 from pipeline_state import initial_state
 from agents.agent0 import run_agent0_node
 from agents.agent1 import run_agent1_node
@@ -45,6 +46,38 @@ def _init(domain: str, languages: list, n_intents: int,
         max_retries=max_retries,
     )
 
+    # Restore pipeline state from existing CSV files so the orchestrator
+    # does not re-run stages that already completed in a previous session.
+    import pandas as pd
+    from config import (FEATURES_GLOBAL_PATH, CHECKPOINT_FILE,
+                        EXTRACTED_ENTITIES_PATH)
+
+    # Restore prompt set
+    prompt_path = f"prompt_set_{domain.replace(' ', '_')}.csv"
+    if os.path.exists(prompt_path):
+        try:
+            df = pd.read_csv(prompt_path, encoding="utf-8-sig")
+            _state["prompt_set"] = df.to_dict(orient="records")
+        except Exception:
+            pass
+
+    # Restore entity features (Agent 1 output)
+    if os.path.exists(FEATURES_GLOBAL_PATH):
+        try:
+            df = pd.read_csv(FEATURES_GLOBAL_PATH, encoding="utf-8-sig")
+            _state["entity_features_global"] = df.to_dict(orient="records")
+        except Exception:
+            pass
+
+    # Restore web features (Agent 2 output)
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            df = pd.read_csv(CHECKPOINT_FILE, encoding="utf-8-sig")
+            success = (df["overall_confidence"].fillna(0) > 0) & (df["error"].isna())
+            _state["web_features"] = df[success].to_dict(orient="records")
+        except Exception:
+            pass
+
 
 # Tools : each returns a plain-text summary for the orchestrator to reason on
 
@@ -55,6 +88,18 @@ def _tool_run_intent_discovery(
 ) -> str:
     """Discover user intent types and generate realistic search prompts."""
     global _state
+
+    # If a prompt set is already loaded in state (restored from disk at startup),
+    # never regenerate — just return what we have.
+    if _state.get("prompt_set"):
+        n = len(_state["prompt_set"])
+        intents = list({p.get("intent_id") for p in _state["prompt_set"]})
+        return (
+            f"Intent discovery done. "
+            f"Prompts: {n}, Intents: {intents}, Quality score: None/10. "
+            f"Errors: none. (loaded from existing file — not regenerated)"
+        )
+
     if languages:
         _state["languages"] = languages
     _state["n_intents"] = n_intents
@@ -177,6 +222,30 @@ def _tool_run_merge_and_clean(retry_failed: bool = False) -> str:
 
     _state["merge_report"] = report
 
+    # Enrich failed entity report with error types from web_features.csv
+    # so the orchestrator LLM can reason about whether retry is worth it.
+    error_summary = ""
+    failed = report.get("failed_entities", [])
+    if failed:
+        try:
+            import pandas as pd
+            df = pd.read_csv(CHECKPOINT_FILE, encoding="utf-8-sig")
+            failed_set = set(e.lower().strip() for e in failed)
+            failed_rows = df[df["canonical_entity"].str.lower().str.strip().isin(failed_set)]
+            tpd_count  = failed_rows["error"].str.contains("per day|free-models-per-day|402",
+                                                            case=False, na=False).sum()
+            tpm_count  = failed_rows["error"].str.contains("per minute|RPM",
+                                                            case=False, na=False).sum()
+            other_count = len(failed_rows) - tpd_count - tpm_count
+            error_summary = (
+                f" Error breakdown for failed entities: "
+                f"TPD-quota-exhausted={tpd_count} (cannot fix until quota resets), "
+                f"TPM-rate-limit={tpm_count} (may succeed on retry after wait), "
+                f"other={other_count}."
+            )
+        except Exception:
+            pass
+
     return (
         f"Merge complete. Unified matrix: {report['unified_rows']} entities. "
         f"Quality — complete: {report['quality_complete']}, "
@@ -186,11 +255,13 @@ def _tool_run_merge_and_clean(retry_failed: bool = False) -> str:
         f"TripAdvisor: {report['ta_coverage_pct']}%, "
         f"Wikipedia: {report['wikipedia_coverage_pct']}%. "
         f"Failed entities needing retry: {report['failed_entities'] or 'none'}."
+        f"{error_summary}"
     )
 
 
 def _tool_get_status() -> str:
     """Return a summary of the current pipeline state."""
+    import os
     prompt_set = _state.get("prompt_set", [])
     entities   = _state.get("entity_features_global", [])
     web        = _state.get("web_features", [])
@@ -198,16 +269,57 @@ def _tool_get_status() -> str:
     entity_names = [e.get("canonical_entity") for e in entities[:8]]
     web_coverage = round(len(web) / len(entities), 2) if entities else 0
 
+    # Agent 1 completion status
+    agent1_status = "not started"
+    raw_path = "geo_output/raw_responses.csv"
+    if os.path.exists(raw_path):
+        try:
+            import pandas as pd
+            df1 = pd.read_csv(raw_path, encoding="utf-8-sig")
+            done = len(df1)
+            planned = len(prompt_set) * 3 * 5  # prompts × slots × runs
+            slots_done = df1["model_slot"].value_counts().to_dict() if "model_slot" in df1.columns else {}
+            agent1_status = (
+                f"{done} responses collected (planned {planned}). "
+                f"Slot breakdown: {slots_done}. "
+                f"NOTE: missing slot responses are due to quota exhaustion — "
+                f"do NOT retry Agent 1, proceed with available data."
+            )
+        except Exception:
+            agent1_status = "file exists but unreadable"
+
+    # Agent 2 error status
+    agent2_status = "not started"
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            import pandas as pd
+            df2 = pd.read_csv(CHECKPOINT_FILE, encoding="utf-8-sig")
+            success = (df2["overall_confidence"].fillna(0) > 0) & (df2["error"].isna())
+            n_ok  = int(success.sum())
+            n_err = int((~success).sum())
+            tpd = df2[~success]["error"].str.contains("per day|free-models-per-day|402",
+                                                       case=False, na=False).sum()
+            tpm = df2[~success]["error"].str.contains("per minute|RPM",
+                                                       case=False, na=False).sum()
+            agent2_status = (
+                f"{n_ok} entities succeeded, {n_err} failed. "
+                f"Error types: TPD-quota-exhausted={tpd} (unretriable until midnight), "
+                f"TPM-rate-limit={tpm} (retriable)."
+            )
+        except Exception:
+            agent2_status = "file exists but unreadable"
+
     status = {
-        "domain":                _state.get("domain"),
-        "languages":             _state.get("languages"),
-        "prompts_generated":     len(prompt_set),
-        "intent_types":          list({p.get("intent_id") for p in prompt_set}),
-        "entities_found":        len(entities),
-        "top_entities":          entity_names,
-        "web_coverage":          f"{len(web)}/{len(entities)} ({web_coverage*100:.0f}%)",
-        "errors":                _state.get("errors", []),
-        "token_usage":           _state.get("token_usage", {}),
+        "domain":            _state.get("domain"),
+        "prompts_generated": len(prompt_set),
+        "intent_types":      list({p.get("intent_id") for p in prompt_set}),
+        "agent1_status":     agent1_status,
+        "entities_found":    len(entities),
+        "top_entities":      entity_names,
+        "agent2_status":     agent2_status,
+        "web_coverage":      f"{len(web)}/{len(entities)} ({web_coverage*100:.0f}%)",
+        "errors":            _state.get("errors", []),
+        "token_usage":       _state.get("token_usage", {}),
     }
     return json.dumps(status, indent=2, ensure_ascii=False)
 
@@ -324,12 +436,20 @@ Guidelines:
 - If intent discovery produces fewer than 4 intents or the prompts look weak, adjust parameters and retry.
 - If entity extraction finds fewer than 3 entities, consider retrying with more prompts.
 - Web research is optional if the goal is only about entity mentions — use your judgment.
+- NEVER retry run_entity_extraction because of missing slot responses — missing slots are caused by
+  quota exhaustion on the provider side and retrying will not fix them. Always proceed with the
+  responses already collected.
 - After web research completes, ALWAYS call run_merge_and_clean to produce the unified feature matrix.
-- If run_merge_and_clean reports failed entities, decide whether to call it again with retry_failed=True
-  (worth it if fewer than 5 entities failed; skip if most are failed — indicates a systemic issue).
-- Do not retry indefinitely — if 2 retries fail, move on and finish with what you have.
-- Call finish when: the unified feature matrix is ready, OR you have tried and the data is the best available.
-- The standard pipeline order is: intent_discovery → entity_extraction → web_research → merge_and_clean → finish.
+- If run_merge_and_clean reports failed entities, READ the error breakdown it provides and reason:
+    * If TPD-quota-exhausted > 0: these entities cannot be fixed now — quota resets at UTC midnight.
+      Do NOT retry them immediately. Accept them as unresolvable for this session and call finish.
+    * If TPM-rate-limit > 0: these are transient — call run_web_research again (resume logic retries
+      only failed entities), then call run_merge_and_clean again. Repeat up to 3 times.
+    * If other > 0: retry once. If they fail again, accept as unresolvable.
+- Never retry TPD-exhausted entities — it wastes quota and will not succeed.
+- Never call finish while TPM-failed or other-failed entities remain unless you have retried 3 times.
+- The standard pipeline order is: intent_discovery → entity_extraction → web_research → merge_and_clean
+  → [reflect on errors → retry only if TPM or other, not TPD] → finish.
 """.format(tools=_TOOLS_SCHEMA)
 
 
@@ -364,13 +484,46 @@ def run_orchestrator(
     _init(domain, languages or ["fr"], n_intents, n_variants, max_retries)
 
     if goal is None:
-        goal = (
-            f"Conduct a full GEO (Generative Engine Optimization) analysis for '{domain}'. "
-            f"1) Generate diverse user prompts covering different intents. "
-            f"2) Query LLMs to discover which brands/restaurants are mentioned. "
-            f"3) Collect web presence data for the top entities. "
-            f"Aim for at least 4 distinct intents, 5+ entities, and web data for 70%+ of entities."
-        )
+        # Detect current pipeline state and set goal accordingly
+        import os, pandas as pd
+        _agent2_errors = 0
+        _agent2_tpd    = 0
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                _df2 = pd.read_csv(CHECKPOINT_FILE, encoding="utf-8-sig")
+                _success = (_df2["overall_confidence"].fillna(0) > 0) & (_df2["error"].isna())
+                _agent2_errors = int((~_success).sum())
+                _agent2_tpd = int(_df2[~_success]["error"].str.contains(
+                    "per day|free-models-per-day|402", case=False, na=False).sum())
+            except Exception:
+                pass
+
+        if _agent2_errors > 0 and _agent2_errors == _agent2_tpd:
+            # All failures are TPD — nothing to retry
+            goal = (
+                f"The GEO pipeline for '{domain}' is mostly complete. "
+                f"Agent 1 and Agent 2 have already run. "
+                f"{_agent2_errors} entities failed due to TPD quota exhaustion and cannot be retried now. "
+                f"Your task: call run_merge_and_clean to produce the final unified matrix, then finish. "
+                f"Do NOT rerun entity extraction or web research."
+            )
+        elif _agent2_errors > 0:
+            # Some failures are retryable
+            goal = (
+                f"The GEO pipeline for '{domain}' is resuming. "
+                f"Agent 1 is complete — do NOT rerun entity extraction. "
+                f"{_agent2_errors} Agent 2 entities failed and need to be retried. "
+                f"Your task: call run_web_research (resume logic retries only failed entities), "
+                f"then run_merge_and_clean. Repeat until no retryable errors remain, then finish."
+            )
+        else:
+            goal = (
+                f"Conduct a full GEO (Generative Engine Optimization) analysis for '{domain}'. "
+                f"1) Generate diverse user prompts covering different intents. "
+                f"2) Query LLMs to discover which brands/restaurants are mentioned. "
+                f"3) Collect web presence data for the top entities. "
+                f"Aim for at least 4 distinct intents, 5+ entities, and web data for 70%+ of entities."
+            )
 
     print(f"\n{'='*60}")
     print(f"[Orchestrator] Goal: {goal}")

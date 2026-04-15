@@ -1,0 +1,396 @@
+\chapter{Implementation and Evaluation}
+\label{chap:impl}
+
+The preceding chapter defined the GEO pipeline at the architectural level.
+This chapter documents how that architecture was translated into a working system,
+following the execution order of the pipeline: from prompt generation through
+multi-model querying, entity resolution, and web presence research, to the
+experimental configuration and results. For each agent, the focus is on the
+implementation decisions that the design phase left open and the non-trivial
+engineering problems that arose during development.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Development Environment and Technology Stack}
+\label{sec:devenv}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+The system was implemented in \textbf{Python 3.11} on a standard Windows 10 machine
+without GPU hardware. This constraint directly shaped every technology choice:
+all LLM inference had to be accessible via cloud APIs, all components had to operate
+within free or low-cost tiers, and the tool integration layer had to remain
+replaceable without touching agent logic.
+
+Table~\ref{tab:stack} summarises the technologies selected under these constraints.
+The three LLM providers were chosen to be complementary: Groq for speed,
+OpenRouter for breadth of fallback models, and Mistral as a paid independent pool
+for reliable structured output. The custom \texttt{ModelRegistry} ties them together
+by managing quota state across all providers and keys autonomously.
+
+\begin{table}[H]
+\centering
+\caption{Technology Stack}
+\label{tab:stack}
+\begin{tabular}{|p{3.2cm}|p{3.0cm}|p{6.8cm}|}
+\hline
+\textbf{Component} & \textbf{Technology} & \textbf{Role and Rationale} \\
+\hline
+Language & Python 3.11 & Native async support, dominant LLM tooling ecosystem \\
+\hline
+Orchestration & Custom ReAct + LangGraph & Adaptive execution, context-sensitive pipeline control \\
+\hline
+LLM Provider 1 & Groq API & Sub-second inference via GroqChip hardware; first-priority \\
+\hline
+LLM Provider 2 & OpenRouter & Unified access to 1,610+ models; primary fallback pool \\
+\hline
+LLM Provider 3 & Mistral API & Reliable JSON output; independent paid quota pool \\
+\hline
+Model Management & Custom \texttt{ModelRegistry} & Per-model quota tracking, autonomous provider rotation \\
+\hline
+Tool Protocol & FastMCP (stdio) & MCP-compliant tool servers, decoupled from agent code \\
+\hline
+Web Search & DuckDuckGo, SerpAPI & Complementary sources for entity web presence \\
+\hline
+Data Storage & pandas (CSV) & Incremental checkpointing, fault-tolerant resumption \\
+\hline
+Fuzzy Matching & RapidFuzz & C-accelerated Levenshtein distance for entity deduplication \\
+\hline
+Encoding & UTF-8 BOM (\texttt{utf-8-sig}) & French/Arabic character support on Windows CP1252 \\
+\hline
+\end{tabular}
+\end{table}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Agent 0: Prompt Generation and Self-Validation}
+\label{sec:agent0impl}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+Agent~0 generates the prompt set that drives the entire downstream analysis.
+Its primary implementation challenge is quality control: an LLM left unconstrained
+will produce prompts that are geographically vague, phrased to elicit generic
+cuisine descriptions rather than specific brand names, or written in English
+regardless of the requested language.
+
+Three constraints are enforced via the system prompt. First, every prompt must be
+geographically anchored to a specific Tunisian city — prompts drifting to Paris or
+other non-Tunisian locations are structurally invalid for this study. Second, at
+least 60\% of prompts must use formulations that force the responding LLM to recall
+and name specific establishments — superlatives, rankings, and \textit{``cite-moi''}
+constructions qualify; open-ended questions do not. Third, prompt text must be
+written in the target language rather than defaulting to English.
+
+These constraints are enforced not by post-hoc filtering but by a \textbf{self-reflection
+loop}: after generating each intent's variants, Agent~0 evaluates its own output
+against the quality criteria and returns a structured report including a quality score,
+a brand-eliciting percentage, and a \texttt{proceed} flag. If the flag is false, the
+agent regenerates with additional intent categories injected into the next iteration.
+The loop runs for at most two cycles, after which the best available output is accepted.
+
+A final guard ensures that an existing prompt CSV is never overwritten by a new
+generation run. This protects a manually curated prompt set from being silently
+replaced by a lower-quality LLM-generated one during pipeline restarts.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Agent 1: Multi-Model Querying and Entity Processing}
+\label{sec:agent1impl}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+Agent~1 is the most computationally intensive stage, responsible for 450 LLM calls,
+named entity extraction, entity deduplication, and GEO feature computation.
+Its implementation raises three non-trivial decisions: how to preserve measurement
+consistency across provider switches, how to resolve surface-form variation in
+extracted entities, and how to quantify entity visibility in a way that captures
+both frequency and positional stability.
+
+\subsection{Slot Abstraction for Cross-Provider Consistency}
+
+A core requirement of the GEO analysis is that entity visibility be measured
+comparably across model capability tiers. If the pipeline records which specific
+model and provider answered each query, a provider switch mid-run introduces a
+confounding variable that conflates provider effects with model scale effects.
+
+This is resolved through a \textbf{slot abstraction}: each model tier is assigned
+a fixed label (\texttt{llama-small}, \texttt{qwen-medium}, \texttt{llama-large}),
+and this label — not the actual model identifier — is what gets recorded in the output.
+When Groq's daily quota is exhausted for \texttt{llama-large}, the registry
+substitutes the OpenRouter equivalent at the same capability tier, but the slot
+label remains unchanged. Per-tier GEO comparisons therefore remain valid regardless
+of how many provider switches occurred during the run.
+
+LLM parameters are also differentiated by role: querying runs at \texttt{temperature=0.7}
+to encourage lexical diversity across the five runs; entity extraction runs at
+\texttt{temperature=0.0} for deterministic, reproducible NER output.
+
+\subsection{Two-Phase Entity Resolution}
+
+Raw responses contain entities in highly variable surface forms: \textit{``Dar El Jeld''},
+\textit{``dar el jeld''}, and \textit{``Restaurant Dar El Jeld''} must resolve to
+the same canonical entity. Aggressive merging risks conflating distinct establishments;
+under-merging fragments mention statistics across variants of the same entity.
+
+The pipeline applies a two-phase resolution strategy.
+\textbf{Phase B} uses \texttt{RapidFuzz}'s \texttt{token\_sort\_ratio}, which handles
+word-order variance (\textit{``el ksar''} vs \textit{``ksar el''}) without penalising
+legitimate transpositions. A score above 88 triggers automatic merge; a score between
+75 and 87 flags the pair as ambiguous.
+
+\textbf{Phase C} submits ambiguous pairs to an LLM arbitrator with a conservative
+default of DIFFERENT — two names are merged only when the difference reduces to a
+pure spelling variant, article prepend, or transliteration. The same call validates
+entity legitimacy, rejecting establishments that are not Tunisian or North African
+food-service businesses. This two-phase design keeps the fast local computation in
+Phase B while delegating edge cases that require semantic reasoning to Phase C.
+
+\subsection{GEO Visibility Scoring}
+
+The central GEO metric is the \textbf{mention rate}: the fraction of all responses
+in which an entity appears. Mention rate alone is insufficient, however — an entity
+mentioned once at a consistent top position and one mentioned erratically across
+many responses may have identical rates but very different GEO value.
+
+The \textbf{stability score} addresses this by jointly weighting mention frequency
+and ranking consistency:
+
+\begin{equation}
+\text{stability} \;=\; \text{mention\_rate} \;\times\; \frac{1}{1 + \sigma_{\text{rank}}}
+\label{eq:stability}
+\end{equation}
+
+where $\sigma_{\text{rank}}$ is the standard deviation of ranking positions across
+all mentions. Entities are classified as \textit{stable} (score $\geq 0.75$),
+\textit{variable} ($0.40 \leq$ score $< 0.75$), or \textit{unstable} (score $< 0.40$).
+Three complementary features complete the GEO profile of each entity:
+\texttt{mention\_prominence} (fraction of mentions in top-3 positions),
+\texttt{cross\_model\_rate} (fraction of model tiers that mention the entity), and
+\texttt{co\_mention\_rate} (co-occurrence frequency with other top-ranked entities).
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Agent 2: Autonomous Web Presence Research}
+\label{sec:agent2impl}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+Agent~2 collects web presence data for each canonical entity by executing a
+structured research protocol across seven sources: Google Maps, TripAdvisor,
+Wikidata, official website, phone directory, Instagram, and Facebook.
+The key implementation challenge is that this process cannot be scripted as a
+fixed API call sequence — source availability varies per entity, results require
+interpretation, and cascading dependencies exist between steps (a website must be
+found before it can be scraped for social handles). A ReAct agent driving MCP tool
+calls is therefore the appropriate mechanism.
+
+\subsection{Tool-Capable Model Guard}
+
+Agent~2 requires a model that reliably supports structured tool calling in a
+multi-step ReAct loop. The \texttt{ModelRegistry} is designed to return any available
+model as a fallback when the preferred model is quota-exhausted — a behaviour
+appropriate for Agent~1 but dangerous for Agent~2, which would silently degrade
+to a model incapable of tool calling.
+
+A \texttt{\_TOOL\_CAPABLE} whitelist addresses this: when the registry returns a
+model outside the list, it is rejected and the next candidate in the list is tried.
+This guard is applied at both the initial model selection and at every model switch
+triggered by quota exhaustion during processing, ensuring that Agent~2 never operates
+on an untested model regardless of registry fallback behaviour.
+
+\subsection{Confidence Scoring and Fault Tolerance}
+
+At the end of each entity's research cycle, the agent produces an
+\texttt{overall\_confidence} score according to explicit calibration guidelines:
+0.0 indicates no usable data found; 0.5 indicates partial single-source coverage;
+0.9 or above indicates multi-source verification including review data and at least
+two independent signals. Delegating this assessment to the agent — rather than
+computing it post-hoc from a fixed formula — allows the score to reflect data
+consistency and plausibility, not just source count. A separate
+\texttt{data\_source\_count} field, computed deterministically as a sum of binary
+presence indicators, provides an objective cross-check.
+
+Fault tolerance is enforced through a \texttt{done\_keys} filter at startup: only
+rows with \texttt{confidence > 0} and no error are considered complete. Rows written
+during quota failures are excluded and retried automatically on the next run.
+The \texttt{SupervisorAgent} handles in-session failures by classifying each error
+as either transient (TPM: wait and retry) or terminal (TPD: mark exhausted and
+switch model). Table~\ref{tab:supervisor} details the classification rules.
+
+\begin{table}[H]
+\centering
+\caption{Supervisor Error Classification Rules}
+\label{tab:supervisor}
+\begin{tabular}{|p{4.5cm}|p{3.0cm}|p{5.5cm}|}
+\hline
+\textbf{Error Signal} & \textbf{Action} & \textbf{Notes} \\
+\hline
+HTTP 429 + ``per day'' / ``free-models-per-day'' / HTTP 402 & \texttt{switch\_model} & Mark TPD-exhausted, persist timestamp to JSON \\
+\hline
+HTTP 429 + ``per minute'' / ``RPM'' & \texttt{wait\_retry} & Extract wait time from error message \\
+\hline
+HTTP 413 + token limit & \texttt{switch\_model} & Registry learns capacity, skips model for oversized prompts \\
+\hline
+HTTP 500 / 502 / 503 & \texttt{retry} & Transient server error, immediate retry \\
+\hline
+5+ consecutive RPM errors & \texttt{switch\_model} & Escape RPM loop; model effectively unusable \\
+\hline
+attempt $\geq 4$ & \texttt{skip} & Write error row with confidence~=~0, continue \\
+\hline
+\end{tabular}
+\end{table}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Engineering Challenges and Solutions}
+\label{sec:challenges}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+Beyond the agent-level decisions above, development surfaced a set of
+system-wide failures that were only discoverable under live API conditions.
+Table~\ref{tab:challenges} documents each failure, its root cause, and the fix applied.
+
+\begin{table}[H]
+\centering
+\caption{Engineering Challenges and Implemented Solutions}
+\label{tab:challenges}
+\begin{tabular}{|p{3.6cm}|p{4.6cm}|p{4.6cm}|}
+\hline
+\textbf{Challenge} & \textbf{Root Cause} & \textbf{Solution} \\
+\hline
+Pipeline stalls on TPD exhaustion & No persistent per-model daily quota state & Registry persists exhaustion timestamps to JSON; survives restarts \\
+\hline
+Infinite RPM retry loop & Attempt counter decremented on wait-retry path, keeping it perpetually at 1 & Removed decrement; each wait consumes the attempt budget \\
+\hline
+\texttt{free-models-per-day} misclassified as TPM & Hyphenated string not matched by ``per day'' substring & Exact string added to TPD list; TPD evaluated before TPM \\
+\hline
+First CSV column name corrupted on Windows & Missing \texttt{utf-8-sig} codec prepends BOM bytes to first column & Consistent \texttt{utf-8-sig} on all read and write operations \\
+\hline
+French prompt set silently overwritten & LLM defaults to English on regeneration; no file guard & \texttt{agent0\_run()} never overwrites an existing prompt CSV \\
+\hline
+Error rows permanently skipped on resume & \texttt{\_load\_done()} counted all rows including failed ones & Filter: \texttt{confidence > 0} AND \texttt{error} is null \\
+\hline
+Agent 2 using non-tool-capable models & Registry returns any available fallback when preferred exhausted & Guard rejects models not in \texttt{\_TOOL\_CAPABLE} whitelist \\
+\hline
+8B models reject Agent 2 system prompt & System prompt exceeds small model's token budget & Registry learns capacity from 413 errors; skips model for oversized prompts \\
+\hline
+\end{tabular}
+\end{table}
+
+A common thread across these failures is that each one assumes a well-behaved external
+environment: consistent error string formats, reliable codec defaults, and predictable
+fallback behaviour. None of these assumptions held in practice, and none of the failures
+were detectable through static analysis or unit testing alone.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Experimental Setup}
+\label{sec:setup}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Domain and Motivation}
+
+The experiment targets \textbf{Tunisian restaurants} across all cities and price
+segments. This domain was selected for three reasons: it exhibits a large and directly
+observable GEO visibility gap between internationally documented establishments and
+those unknown outside Tunisia; it provides a realistic test of cross-lingual entity
+normalisation due to the French-Arabic bilingual character of Tunisian online content;
+and it extends GEO research to a North African, Francophone context that the
+existing literature has not addressed~\cite{aggarwal2023geo}.
+
+\subsection{Prompt Set and Query Configuration}
+
+The study uses 30 French-language prompts across six intent categories
+(Table~\ref{tab:prompts}), each evaluated under three model slots for five
+independent runs:
+
+\[
+N \;=\; P \times S \times R \;=\; 30 \times 3 \times 5 \;=\; 450 \;\text{LLM queries}
+\]
+
+The three-tier slot design (\texttt{llama-small} 8B, \texttt{qwen-medium} 32B,
+\texttt{llama-large} 70B) enables detection of scale-dependent visibility differences.
+The five-run repetition supports stability estimation: an entity appearing consistently
+across all runs of a given (prompt, slot) pair has high GEO reliability; one appearing
+in a single run does not.
+
+\begin{table}[H]
+\centering
+\caption{Prompt Set: Intent Categories and Examples}
+\label{tab:prompts}
+\begin{tabular}{|p{3.8cm}|p{4.5cm}|p{5.4cm}|}
+\hline
+\textbf{Intent} & \textbf{Description} & \textbf{Example Prompt} \\
+\hline
+\texttt{top\_recommendation} & Best restaurants by reputation & \textit{``Quel est le meilleur restaurant tunisien à Tunis ?''} \\
+\hline
+\texttt{cuisine\_authentique} & Traditional dish recommendations & \textit{``Quel restaurant est réputé pour son couscous à Tunis ?''} \\
+\hline
+\texttt{localisation} & Restaurants in a specific district & \textit{``Quels restaurants recommandes-tu dans le quartier La Marsa ?''} \\
+\hline
+\texttt{occasion\_speciale} & Context-specific venue recommendations & \textit{``Quel restaurant pour un dîner romantique à Tunis ?''} \\
+\hline
+\texttt{comparatif} & Explicit ranking and comparison & \textit{``Classe les 5 meilleurs restaurants tunisiens à Tunis.''} \\
+\hline
+\texttt{avis\_touristes} & Tourist-oriented queries & \textit{``Je suis touriste à Tunis, quel restaurant me recommandes-tu ?''} \\
+\hline
+\end{tabular}
+\end{table}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Results}
+\label{sec:results}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\textit{Note: Results will be reported in full following pipeline completion.
+The subsections below will be updated with per-agent quantitative analysis.}
+
+\subsection{Agent 0 — Prompt Set Validation}
+The self-reflection mechanism confirmed 100\% brand-elicitation validity across
+all 30 prompts, six balanced intent categories, and coverage of seven Tunisian cities.
+
+\subsection{Agent 1 — Response Collection and Entity Extraction}
+\textit{[To be completed.]}
+
+\subsection{Agent 2 — Web Presence Research}
+\textit{[To be completed.]}
+
+\subsection{Agent 3 — GEO Scoring and Visibility Ranking}
+\textit{[To be completed.]}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Architecture Validation}
+
+Two architectural claims from Chapter~\ref{chap:design} received direct empirical
+validation during the partial run. When Groq daily quota exhausted within minutes
+of the first session, the registry substituted OpenRouter equivalents transparently,
+with no impact on slot label consistency and no manual intervention — confirming
+that the slot abstraction performs correctly under real provider switching conditions.
+The ReAct orchestrator detected that a pre-built French prompt set already existed
+and bypassed Agent~0 generation entirely, advancing directly to entity extraction.
+This is precisely the kind of context-sensitive shortcut that fixed-graph pipelines
+cannot perform.
+
+\subsection{Limitations}
+
+Three limitations bear on the current results.
+Entity rankings from a partial query run are directional rather than definitive;
+full 450-query coverage is required for confidence-interval-based comparisons.
+The cleaning pipeline does not yet apply geographic validation, allowing
+non-Tunisian establishments to persist as false positives — a fix that is
+straightforward given the Wikidata \texttt{country} field already collected by
+Agent~2.
+Finally, five runs per (prompt, slot) pair produce substantial variance for
+infrequent entities; ten or more runs would be preferable for tail-entity analysis.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Chapter Summary}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+This chapter followed the pipeline agent by agent, documenting the implementation
+decisions that shaped system correctness and robustness.
+Agent~0's self-reflection loop enforces prompt quality without manual curation.
+Agent~1's slot abstraction decouples measurement identity from provider identity,
+and its two-phase entity resolution balances speed with precision.
+Agent~2's tool-capable model guard and supervisor-driven error classification
+ensure that web research degrades gracefully under quota pressure rather than
+silently failing.
+The engineering challenges in Table~\ref{tab:challenges} illustrate a broader
+point: resilient multi-provider LLM pipelines cannot be fully validated by design
+alone — they require empirical testing under live quota and encoding conditions.
+\end{document}
