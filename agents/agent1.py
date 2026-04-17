@@ -63,9 +63,6 @@ def _get_client(provider: str = "groq", api_key: str = ""):
     _client_cache[cache_key] = client
     return client
 
-"""# **Imports, Config**"""
-
-# config
 from config import QUERY_MODELS as QUERY_MODELS
 
 MODEL_EXTRACTOR       ="mistral-small-latest" #"llama-3.3-70b-versatile"
@@ -81,9 +78,6 @@ RAW_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "raw_responses.csv")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-"""# **TOKEN_USAGE, _model_params, query_llm**"""
-
-# token tracker
 # Per-run token accumulator — reset by the node function before each pipeline
 # invocation so state from one run never bleeds into another.
 TOKEN_USAGE: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -116,7 +110,6 @@ def _model_params(model: str, role: str = "analyst", provider: str = "groq") -> 
 
     return base
 
-    # rate limit parser
 def _parse_wait_time(err_msg: str) -> float:
     m = re.search(r"try again in (\d+)m([\d.]+)s", err_msg)
     if m:
@@ -129,7 +122,6 @@ def _parse_wait_time(err_msg: str) -> float:
         return int(m.group(1)) * 60
     return 0.0
 
-# fatal errors
 FATAL_ERRORS = [
     "model not found",
     "invalid api key",
@@ -138,11 +130,9 @@ FATAL_ERRORS = [
     "does not exist"
 ]
 
-# query_llm
 def _parse_413_agent1(err_msg: str):
     """Extract (limit, requested) from a 413 error. Returns (limit, requested) or None."""
-    import re as _re
-    m = _re.search(r"Limit\s+(\d+),\s*Requested\s+(\d+)", err_msg, _re.I)
+    m = re.search(r"Limit\s+(\d+),\s*Requested\s+(\d+)", err_msg, re.I)
     if m:
         return int(m.group(1)), int(m.group(2))
     return None
@@ -252,65 +242,6 @@ def query_llm(model: str | None, prompt: str, system: str = "",
     print(f"[ERROR] All models exhausted.")
     return empty
 
-def clean_and_parse_json(raw: str, label: str = "") -> list:
-    """
-    Multi-layer JSON parser from notebook.
-    Handles markdown fences, nested arrays, trailing commas,
-    smart quotes, unescaped newlines, qwen3 thinking blocks.
-    """
-    if not raw or not raw.strip():
-        print(f"[WARN] {label}: empty response.")
-        return []
-
-    text = raw.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-
-    def _unwrap(parsed):
-        if (isinstance(parsed, list)
-                and len(parsed) == 1
-                and isinstance(parsed[0], list)):
-            return parsed[0]
-        return parsed
-
-    try:
-        return _unwrap(json.loads(text))
-    except json.JSONDecodeError:
-        pass
-
-    for pattern in (r"(\[.*\])", r"(\{.*\})"):
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            try:
-                return _unwrap(json.loads(match.group(1)))
-            except json.JSONDecodeError:
-                pass
-
-    fixed = re.sub(r",\s*([}\]])", r"\1", text)
-    fixed = fixed.replace("\u201c", '"').replace("\u201d", '"')
-    try:
-        return _unwrap(json.loads(fixed))
-    except json.JSONDecodeError:
-        pass
-
-    try:
-        repaired = re.sub(r'(?<!\\)\n', r'\\n', text)
-        return _unwrap(json.loads(repaired))
-    except json.JSONDecodeError:
-        pass
-
-    print(f"[WARN] {label}: could not parse JSON.")
-    print(f"[RAW] {raw[:400]}")
-    return []
-
-"""# **Step 1** : Batch loader
-*   Input  : prompt_set.csv
-*   Output : list of prompt dicts
-"""
-
-import pandas as pd
-import os
 
 def agent1_load_prompts(prompt_set_path: str) -> list:
 
@@ -338,13 +269,6 @@ def agent1_load_prompts(prompt_set_path: str) -> list:
 
 PROMPT_SET_PATH = "prompt_set_Tunisian_restaurants.csv"  # default path used by node
 
-"""# **Step 2**: LLM querying + progressive saving
-* Input  : list of prompt dicts from Step 1
-*    Output : raw_responses.csv
-*    Schema : response_id · prompt_id · run_id · model_id · intent_id ·
-             language · prompt_text · response_text · completion_tokens ·
-             prompt_tokens · total_tokens · timestamp
-"""
 
 def agent1_query_prompts(
     prompts:      list,
@@ -509,12 +433,6 @@ def agent1_query_prompts(
     return df_raw
 
 
-"""# **Step 3** : Entity extraction
-* Input  : raw_responses.csv
-* Output : extracted_entities.csv
-* Code   : query_llm(role="extractor") per response
-         BRAND_EXTRACTION_SYSTEM + build_brand_extraction_prompt
-"""
 
 def extract_entity_description(raw_text: str, entity: str) -> str:
     """
@@ -613,11 +531,6 @@ def query_mistral(prompt: str, system: str = "") -> dict:
         "prompt_tokens"    : data["usage"]["prompt_tokens"],
         "total_tokens"     : data["usage"]["total_tokens"],
     }
-
-import os
-import csv
-import json
-import pandas as pd
 
 ENTITIES_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "extracted_entities.csv")
 
@@ -912,30 +825,6 @@ def agent1_extract_entities(
     return df_entities
 
 
-"""# **Step 4** : Entity enrichment
-* Input  : raw_responses.csv + extracted_entities.csv
-* Output : enriched_entities.csv
-* Code   : query_llm(role="extractor") per response
-         description_length · list_vs_prose · attribute_tags
-
-         Input  : extracted_entities.csv + raw_responses.csv
-LLM    : MODEL_ANALYST (llama-3.3-70b-versatile)
-Extracts per (prompt_id × entity):
-         mention_count · ranking_position ·
-         first_mention_position · list_vs_prose ·
-         attribute_tags · best_quote · knowledge_coverage
-Output : enriched_entities.csv
-Schema : entity_id · response_id · prompt_id · entity ·
-         mention_count · ranking_position ·
-         first_mention_position · list_vs_prose ·
-         attribute_tags · best_quote · knowledge_coverage
-"""
-
-import os
-import csv
-import json
-import re
-import pandas as pd
 
 ENRICHED_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "enriched_entities.csv")
 
@@ -1167,19 +1056,6 @@ def agent1_enrich_entities(
     return df_enriched
 
 
-"""# **Step 5** : Data cleaning
-* Input  : enriched_entities.csv
-* Output : clean_entities.csv
-"""
-
-
-import os
-import csv
-import json
-import re
-import time
-import unicodedata
-import pandas as pd
 from rapidfuzz import fuzz, process
 
 CLEAN_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "clean_entities.csv")
@@ -1883,31 +1759,7 @@ def agent1_clean_entities(
 
 
 
-"""# **Step 6** : Compute metrics
-* Input  : clean_entities.csv
-* Output : entity_features.csv
-
-"""
-
-"""
-Agent 1 — Step 6: Compute Entity Features
-══════════════════════════════════════════════════════
-Fixes applied:
-  1. compute_prompt_type_response — correct 3-param signature with prompts
-  2. Filter: clean_flag != 'invalid' (keeps clean + flagged)
-  3. total_responses from actual valid data, not df_raw (72)
-  4. total_models from actual data, not hardcoded QUERY_MODELS (4)
-
-Produces:
-  entity_features.csv        — per (prompt_id × canonical_entity)
-  entity_features_global.csv — global per canonical_entity (input to Phase 3)
-"""
-
-import os
-import csv
-import json
 import math
-import pandas as pd
 
 FEATURES_PATH        = os.path.join(OUTPUT_DIR, "entity_features.csv")
 FEATURES_GLOBAL_PATH = os.path.join(OUTPUT_DIR, "entity_features_global.csv")

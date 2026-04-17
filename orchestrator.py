@@ -16,6 +16,7 @@ import json
 import sys
 import os
 import time
+import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -48,7 +49,6 @@ def _init(domain: str, languages: list, n_intents: int,
 
     # Restore pipeline state from existing CSV files so the orchestrator
     # does not re-run stages that already completed in a previous session.
-    import pandas as pd
     from config import (FEATURES_GLOBAL_PATH, CHECKPOINT_FILE,
                         EXTRACTED_ENTITIES_PATH)
 
@@ -196,20 +196,20 @@ def _tool_run_merge_and_clean(retry_failed: bool = False) -> str:
     global _state
 
     if retry_failed:
-        # Identify failed entities from last merge report
-        import json, os
+        # Use LLM-triaged retry list (Agent 3 triage removed hallucinations/non-restaurants).
+        # Fall back to raw failed_entities only if retry_entities is absent (older reports).
         report_path = "geo_output/merge_report.json"
         if os.path.exists(report_path):
             with open(report_path) as f:
                 prev = json.load(f)
-            failed = prev.get("failed_entities", [])
-            if failed:
-                # Override entity list in state to only research failed ones
+            retry = prev.get("retry_entities") or prev.get("failed_entities", [])
+            if retry:
+                print(f"[orchestrator] Retrying {len(retry)} LLM-triaged entities via Agent 2")
                 all_entities = _state.get("entity_features_global", [])
-                failed_set = set(e.lower().strip() for e in failed)
+                retry_set = set(e.lower().strip() for e in retry)
                 _state["_retry_entities"] = [
                     e for e in all_entities
-                    if e.get("canonical_entity", "").lower().strip() in failed_set
+                    if e.get("canonical_entity", "").lower().strip() in retry_set
                 ]
                 result = run_agent2_node(_state)
                 _state.update(result)
@@ -228,7 +228,6 @@ def _tool_run_merge_and_clean(retry_failed: bool = False) -> str:
     failed = report.get("failed_entities", [])
     if failed:
         try:
-            import pandas as pd
             df = pd.read_csv(CHECKPOINT_FILE, encoding="utf-8-sig")
             failed_set = set(e.lower().strip() for e in failed)
             failed_rows = df[df["canonical_entity"].str.lower().str.strip().isin(failed_set)]
@@ -246,6 +245,7 @@ def _tool_run_merge_and_clean(retry_failed: bool = False) -> str:
         except Exception:
             pass
 
+    retry_entities = report.get("retry_entities", [])
     return (
         f"Merge complete. Unified matrix: {report['unified_rows']} entities. "
         f"Quality — complete: {report['quality_complete']}, "
@@ -254,7 +254,10 @@ def _tool_run_merge_and_clean(retry_failed: bool = False) -> str:
         f"Coverage — Google Maps: {report['gm_coverage_pct']}%, "
         f"TripAdvisor: {report['ta_coverage_pct']}%, "
         f"Wikipedia: {report['wikipedia_coverage_pct']}%. "
-        f"Failed entities needing retry: {report['failed_entities'] or 'none'}."
+        f"LLM triage: {len(retry_entities)} entities confirmed real and queued for retry "
+        f"(hallucinations/non-restaurants/generics already removed from output). "
+        f"To retry them call run_merge_and_clean(retry_failed=True). "
+        f"Retry queue: {retry_entities or 'none'}."
         f"{error_summary}"
     )
 
@@ -274,7 +277,6 @@ def _tool_get_status() -> str:
     raw_path = "geo_output/raw_responses.csv"
     if os.path.exists(raw_path):
         try:
-            import pandas as pd
             df1 = pd.read_csv(raw_path, encoding="utf-8-sig")
             done = len(df1)
             planned = len(prompt_set) * 3 * 5  # prompts × slots × runs
@@ -292,7 +294,6 @@ def _tool_get_status() -> str:
     agent2_status = "not started"
     if os.path.exists(CHECKPOINT_FILE):
         try:
-            import pandas as pd
             df2 = pd.read_csv(CHECKPOINT_FILE, encoding="utf-8-sig")
             success = (df2["overall_confidence"].fillna(0) > 0) & (df2["error"].isna())
             n_ok  = int(success.sum())
@@ -440,16 +441,21 @@ Guidelines:
   quota exhaustion on the provider side and retrying will not fix them. Always proceed with the
   responses already collected.
 - After web research completes, ALWAYS call run_merge_and_clean to produce the unified feature matrix.
+- run_merge_and_clean now includes LLM triage: it automatically removes hallucinations, non-restaurants,
+  and generic entities from the output and returns a retry_entities list of confirmed real restaurants.
+- If run_merge_and_clean reports retry_entities > 0, call run_merge_and_clean(retry_failed=True) to
+  re-run Agent 2 only for those triaged entities, then call run_merge_and_clean again to re-merge.
+  Repeat up to 2 times. After 2 retries accept remaining failures as unresolvable.
 - If run_merge_and_clean reports failed entities, READ the error breakdown it provides and reason:
     * If TPD-quota-exhausted > 0: these entities cannot be fixed now — quota resets at UTC midnight.
       Do NOT retry them immediately. Accept them as unresolvable for this session and call finish.
-    * If TPM-rate-limit > 0: these are transient — call run_web_research again (resume logic retries
-      only failed entities), then call run_merge_and_clean again. Repeat up to 3 times.
+    * If TPM-rate-limit > 0: these are transient — call run_merge_and_clean(retry_failed=True).
+      Repeat up to 3 times.
     * If other > 0: retry once. If they fail again, accept as unresolvable.
 - Never retry TPD-exhausted entities — it wastes quota and will not succeed.
-- Never call finish while TPM-failed or other-failed entities remain unless you have retried 3 times.
+- Never call finish while retry_entities remain unless you have retried 2 times.
 - The standard pipeline order is: intent_discovery → entity_extraction → web_research → merge_and_clean
-  → [reflect on errors → retry only if TPM or other, not TPD] → finish.
+  → [retry_failed=True if retry_entities > 0] → merge_and_clean → finish.
 """.format(tools=_TOOLS_SCHEMA)
 
 
@@ -485,7 +491,6 @@ def run_orchestrator(
 
     if goal is None:
         # Detect current pipeline state and set goal accordingly
-        import os, pandas as pd
         _agent2_errors = 0
         _agent2_tpd    = 0
         if os.path.exists(CHECKPOINT_FILE):

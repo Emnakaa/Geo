@@ -29,6 +29,41 @@ def _apify_token() -> str:
     return APIFY_API_TOKENS[_apify_idx] if _apify_idx < len(APIFY_API_TOKENS) else ""
 
 
+def _rotate_apify() -> bool:
+    global _apify_idx
+    if _apify_idx + 1 < len(APIFY_API_TOKENS):
+        _apify_idx += 1
+        print(f"[scrape_server] Apify rotated to token {_apify_idx + 1}")
+        return True
+    return False
+
+
+def _apify_run(actor_id: str, input_data: dict, timeout: int = 90) -> list:
+    """Run an Apify actor, rotating tokens on quota/auth errors."""
+    from apify_client import ApifyClient
+    tried = 0
+    total = len(APIFY_API_TOKENS)
+    while tried < total:
+        try:
+            client = ApifyClient(_apify_token())
+            run = client.actor(actor_id).call(run_input=input_data, timeout_secs=timeout)
+            if run is None:
+                if _rotate_apify():
+                    tried += 1
+                    continue
+                return []
+            items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+            return items
+        except Exception as e:
+            err = str(e).lower()
+            if any(kw in err for kw in ("quota", "limit", "unauthorized", "payment", "403", "402")):
+                if _rotate_apify():
+                    tried += 1
+                    continue
+            return []
+    return []
+
+
 def _delay(lo=0.3, hi=0.8):
     time.sleep(random.uniform(lo, hi))
 
@@ -51,14 +86,8 @@ def scrape_instagram(handle: str | None = None) -> dict:
         return result
 
     try:
-        from apify_client import ApifyClient
-        client = ApifyClient(_apify_token())
-
-        run = client.actor("apify/instagram-profile-scraper").call(
-            run_input={"usernames": [handle], "resultsLimit": 1},
-            timeout_secs=300,
-        )
-        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        items = _apify_run("apify/instagram-profile-scraper",
+                           {"usernames": [handle], "resultsLimit": 1}, timeout=300)
         if items:
             r = items[0]
             result["ig_followers"]       = r.get("followersCount", 0)
@@ -85,19 +114,12 @@ def scrape_facebook(handle: str | None = None) -> dict:
         return result
 
     try:
-        from apify_client import ApifyClient
-        client = ApifyClient(_apify_token())
-
-        run = client.actor("apify/facebook-pages-scraper").call(
-            run_input={
-                "startUrls": [{"url": f"https://www.facebook.com/{handle}"}],
-                "resultsLimit": 10,
-                "maxPostComments": 0,
-                "maxReviews": 0,
-            },
-            timeout_secs=180,
-        )
-        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        items = _apify_run("apify/facebook-pages-scraper", {
+            "startUrls": [{"url": f"https://www.facebook.com/{handle}"}],
+            "resultsLimit": 10,
+            "maxPostComments": 0,
+            "maxReviews": 0,
+        }, timeout=180)
         if items:
             page  = items[0]
             posts = page.get("posts", []) or []

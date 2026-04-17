@@ -1,0 +1,387 @@
+\chapter{Implementation and Evaluation}
+\label{chap:impl}
+
+The preceding chapter defined the GEO pipeline at the architectural level.
+This chapter documents how that architecture was translated into a working system:
+the technology choices made under real resource constraints, the non-trivial
+engineering decisions that the design left open, the concrete failures encountered
+during development and how they were resolved, and the experimental results
+obtained on the Tunisian restaurant domain.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Development Environment and Technology Stack}
+\label{sec:devenv}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+The system was implemented in \textbf{Python 3.11} on a standard Windows 10 machine,
+without access to dedicated GPU hardware. This constraint is not incidental: it reflects
+the reality of academic research conducted outside industrial infrastructure, and it
+directly shaped every technology choice made throughout the project.
+
+Three design imperatives governed the selection of components.
+The first was \textit{cost accessibility}: all LLM inference had to operate within
+free or low-cost API tiers, since sustained experimentation across hundreds of queries
+would otherwise be financially prohibitive. This requirement alone motivated the design
+of the dynamic \texttt{ModelRegistry}, which autonomously rotates across providers and
+API keys to maximise available quota rather than relying on a single paid endpoint.
+The second was \textit{architectural decoupling}: the interface between agents and
+external tools had to be defined through a stable protocol rather than direct function
+calls, so that tool implementations could be replaced or extended without modifying
+agent logic. This constraint led to the adoption of the Model Context Protocol (MCP)
+as the tool communication standard.
+The third was \textit{resilient persistence}: given that a complete pipeline run spans
+multiple API sessions subject to daily quota exhaustion, all intermediate results had
+to be checkpointed incrementally to disk, allowing execution to resume at any stage
+without reprocessing already-completed work.
+
+These three imperatives are not independent. The need for free-tier compatibility
+directly drives the registry's complexity, and the need for resumable execution is
+only necessary because free-tier quotas force multi-session runs in the first place.
+Table~\ref{tab:stack} summarises the technologies selected under these constraints.
+
+\begin{table}[H]
+\centering
+\caption{Technology Stack}
+\label{tab:stack}
+\begin{tabular}{|p{3.2cm}|p{3.0cm}|p{6.8cm}|}
+\hline
+\textbf{Component} & \textbf{Technology} & \textbf{Role and Rationale} \\
+\hline
+Language & Python 3.11 & Native async support, dominant LLM tooling ecosystem \\
+\hline
+Orchestration & Custom ReAct + LangGraph state & Adaptive execution, decouples reasoning from tool calls \\
+\hline
+LLM Provider 1 & Groq API & Sub-second inference via dedicated GroqChip hardware \\
+\hline
+LLM Provider 2 & OpenRouter & Unified access to 1,610+ models, primary fallback pool \\
+\hline
+LLM Provider 3 & Mistral API (paid) & Reliable JSON output, independent quota pool for extraction \\
+\hline
+Model Management & Custom \texttt{ModelRegistry} & Per-model quota tracking and autonomous selection \\
+\hline
+Tool Protocol & FastMCP (stdio) & MCP-compliant servers, decoupled from agent code \\
+\hline
+Web Search & DuckDuckGo, SerpAPI & Complementary sources for entity web presence \\
+\hline
+Data Storage & pandas (CSV) & Incremental checkpointing, human-readable output \\
+\hline
+Fuzzy Matching & RapidFuzz & C-accelerated Levenshtein distance for entity deduplication \\
+\hline
+Encoding & UTF-8 BOM (\texttt{utf-8-sig}) & French/Arabic character support on Windows CP1252 \\
+\hline
+\end{tabular}
+\end{table}
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{System Implementation}
+\label{sec:implementation}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+The architecture defined in Chapter~\ref{chap:design} establishes the structural
+blueprint of the pipeline but leaves a number of concrete implementation questions
+open. This section documents the four decisions that most significantly shaped
+the correctness, robustness, and validity of the final system.
+
+% -----------------------------------------------------------------------
+\subsection{Dynamic Model Management and the Slot Abstraction}
+% -----------------------------------------------------------------------
+
+A central requirement of the GEO analysis is that entity visibility be measured
+\textit{comparably across capability tiers}: the same entity must be queried under
+an 8B model, a 32B model, and a 70B model so that scale-dependent visibility can be
+detected. Implementing this correctly requires a design decision that goes beyond
+simple API calls  the \textit{identity} of the measurement instrument must remain
+stable even when the underlying provider changes at runtime.
+
+This is achieved through a \textbf{slot abstraction}: each model is represented by
+a named slot (\texttt{llama-small}, \texttt{qwen-medium}, \texttt{llama-large})
+rather than a specific model identifier. The slot name not the actual model ID is
+what gets recorded in the output file. When Groq quota is exhausted, the registry
+substitutes an OpenRouter equivalent within the same capability tier, but the slot
+label remains unchanged. This ensures that per-tier GEO comparisons remain valid
+across provider switches, which would otherwise introduce a confounding variable
+between provider and model scale.
+
+The \texttt{ModelRegistry} that implements this abstraction operates across three
+providers and up to five API keys per provider, yielding a pool of 1,679 models at
+initialisation. Model selection proceeds in four stages: (1) if the caller specifies
+a preferred model and it is available, use it; (2) otherwise select the highest-tier
+available model that fits the prompt's estimated token count; (3) if no model fits the
+token budget but models are available, attempt with a warning; (4) if no model is
+available at all, raise a \texttt{RuntimeError} with a breakdown of why each model is
+blocked. Availability is determined by a per-model state machine that tracks three
+independent conditions: TPD exhaustion (daily quota spent), TPM blocking (per-minute
+limit active until a specific timestamp), and token capacity (learned from 413 errors).
+
+A particularly important extension of this system is \textit{capacity learning}: when
+a model returns an HTTP~413 error indicating that the request exceeds its token limit,
+the registry records the reported capacity and uses it in subsequent calls to skip the
+model for prompts that are known to exceed it. This eliminates repeated 413 failures
+without requiring manual model configuration.
+
+% -----------------------------------------------------------------------
+\subsection{Two-Phase Entity Resolution}
+% -----------------------------------------------------------------------
+
+Raw LLM responses contain named entities in highly variable surface forms. The same
+restaurant may appear as \textit{``Dar El Jeld''}, \textit{``dar el jeld''}, or
+\textit{``Restaurant Dar El Jeld''} across different runs. Merging these variants into
+a single canonical entity is not trivial: over-aggressive merging conflates distinct
+establishments, while under-merging inflates the entity count and fragments mention
+statistics.
+
+The pipeline resolves this through a two-phase approach. \textbf{Phase B} applies
+fuzzy string matching using \texttt{RapidFuzz}'s \texttt{token\_sort\_ratio}, which
+handles word-order variance (\textit{``el ksar''} vs \textit{``ksar el''}) and is
+C-accelerated for performance. Two thresholds govern the outcome:
+a score above 88 triggers automatic merge; a score between 75 and 87 flags the pair
+as ambiguous and defers it to Phase C.
+
+\textbf{Phase C} submits ambiguous pairs to an LLM arbitrator with a conservative
+default of DIFFERENT: two names are merged only if the evidence is high-confidence,
+i.e., the difference is a pure spelling variant, article prepend, or transliteration.
+Structurally distinct names even with high fuzzy similarity are kept separate.
+The same LLM call also validates entity legitimacy: it checks whether the entity is
+a real food-service establishment in Tunisia or North Africa, and rejects LLM
+hallucinations such as Parisian restaurants appearing in responses about Tunisian
+cuisine.
+
+% -----------------------------------------------------------------------
+\subsection{GEO Visibility Scoring}
+% -----------------------------------------------------------------------
+
+Once entities are cleaned and canonicalised, Agent~1 computes a set of
+GEO-specific features for each entity. The core metric is the \textbf{mention rate}:
+the fraction of all responses (across all prompts, slots, and runs) in which the
+entity appears. However, mention rate alone is insufficient; an entity mentioned
+once across 450 responses and one mentioned consistently across 10 responses may
+have the same raw rate but very different GEO values.
+
+The \textbf{stability score} addresses this by jointly penalising low mention
+frequency and high variance in ranking position:
+
+\begin{equation}
+\text{stability} \;=\; \text{mention\_rate} \;\times\; \frac{1}{1 + \sigma_{\text{rank}}}
+\label{eq:stability}
+\end{equation}
+
+Where $\sigma_{\text{rank}}$ is the standard deviation of ranking positions across
+all mentions of the entity. An entity mentioned in every response at position 1
+achieves a stability score of 1.0; one mentioned rarely and at inconsistent positions
+approaches 0. Entities are classified as \textit{stable} (score $\geq 0.75$),
+\textit{variable} ($0.40 \leq$ score $< 0.75$), or \textit{unstable} (score $< 0.40$).
+
+Three additional features capture complementary dimensions of visibility:
+\texttt{mention\_prominence} (fraction of mentions appearing in the top-3 ranking positions),
+\texttt{cross\_model\_rate} (fraction of distinct model tiers that mention the entity),
+and \texttt{co\_mention\_rate} (how frequently the entity co-appears with other top
+entities in the same response). Together these features constitute the GEO profile
+of each entity, enabling a multidimensional ranking that captures both frequency
+and positional consistency.
+
+% -----------------------------------------------------------------------
+\subsection{Fault-Tolerant Execution and Rate Limit Management}
+% -----------------------------------------------------------------------
+
+Free-tier APIs impose two orthogonal quota types that require fundamentally opposite
+recovery strategies. A \textit{Tokens-Per-Minute} (TPM) limit is transient: the
+affected model recovers within seconds and should be retried after a short wait.
+A \textit{Tokens-Per-Day} (TPD) limit is session-terminal: the model is unusable
+until the UTC midnight quota reset, and retrying it wastes both time and the remaining
+attempt budget allocated to the current entity. Misclassifying these two error types
+has severe consequences in either direction: treating a TPD error as TPM causes the
+pipeline to stall indefinitely; treating a TPM error as TPD permanently discards a
+usable model from the session.
+
+The \texttt{SupervisorAgent} handles this classification through priority-ordered
+keyword matching that evaluates TPD signals \textit{before} TPM signals, since a
+TPD error message may also contain rate-related vocabulary. A particularly subtle
+case encountered during development is OpenRouter's \texttt{free-models-per-day}
+error string, which contains the word ``per'' in a hyphenated compound that naive
+substring matching fails to recognise. This exact string is included explicitly in
+the TPD detection list to prevent misclassification.
+Table~\ref{tab:supervisor} summarises the full classification logic.
+
+\begin{table}[H]
+\centering
+\caption{Supervisor Error Classification Rules}
+\label{tab:supervisor}
+\begin{tabular}{|p{4.5cm}|p{3.0cm}|p{5.5cm}|}
+\hline
+\textbf{Error Signal} & \textbf{Action} & \textbf{Notes} \\
+\hline
+HTTP 429 + ``per day'' / ``free-models-per-day'' / HTTP 402 & \texttt{switch\_model} & Mark TPD-exhausted, persist timestamp to JSON \\
+\hline
+HTTP 429 + ``per minute'' / ``RPM'' & \texttt{wait\_retry} & Extract wait time from error message \\
+\hline
+HTTP 413 + token limit & \texttt{switch\_model} & Registry learns model capacity, skips for oversized prompts \\
+\hline
+HTTP 500 / 502 / 503 & \texttt{retry} & Transient server error, immediate retry \\
+\hline
+5+ consecutive RPM errors & \texttt{switch\_model} & Escape RPM loop, model effectively unusable \\
+\hline
+attempt $\geq 4$ & \texttt{skip} & Write error row, continue to next entity \\
+\hline
+\end{tabular}
+\end{table}
+
+Resumable execution is enforced at every pipeline stage through a \texttt{done\_keys}
+set loaded at startup from the existing output file. For Agent~2 specifically, the
+filter requires both \texttt{confidence > 0} and \texttt{error is null}: rows written
+during failed attempts are excluded from the done set and retried on the next run.
+This distinction is critical without it, quota exhaustion during Agent~2 execution
+would permanently discard web data for every entity being processed at the moment of
+failure.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Engineering Challenges and Solutions}
+\label{sec:challenges}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+The implementation decisions described above were not arrived at deductively.
+They emerged from a development process that surfaced a set of concrete failures,
+each of which exposed a gap between an assumption encoded in the software and the
+actual behaviour of real API providers and operating-system environments.
+Table~\ref{tab:challenges} documents the principal failures, their root causes,
+and the solutions applied.
+
+\begin{table}[H]
+\centering
+\caption{Engineering Challenges and Implemented Solutions}
+\label{tab:challenges}
+\begin{tabular}{|p{4cm}|p{4.6cm}|p{4.6cm}|}
+\hline
+\textbf{Challenge} & \textbf{Root Cause} & \textbf{Solution} \\
+\hline
+Pipeline stalls on TPD exhaustion & No persistent per-model daily quota state & Registry persists exhaustion timestamps to JSON; survives restarts \\
+\hline
+Infinite RPM retry loop & Attempt counter decremented on wait-retry path, keeping it perpetually at 1 & Removed decrement; each wait consumes the attempt budget \\
+\hline
+\texttt{free-models-per-day} misclassified as TPM & Hyphenated OpenRouter string not matched by ``per day'' substring & Exact string added to TPD list; TPD checked before TPM \\
+\hline
+First CSV column name corrupted & Missing \texttt{utf-8-sig} codec on Windows CP1252 prepends BOM bytes to first column & Consistent \texttt{utf-8-sig} encoding on all read and write operations \\
+\hline
+Agent 0 overwrites French prompt set & LLM defaults to English on regeneration; no file protection & \texttt{agent0\_run()} never overwrites an existing prompt CSV \\
+\hline
+Error rows not retried on resume & \texttt{\_load\_done()} counted all rows including failed attempts & Filter: \texttt{confidence > 0} AND \texttt{error} is null \\
+\hline
+Agent 2 selecting non-tool-capable models & \texttt{registry.select()} returns any available fallback when preferred exhausted & Guard rejects returned model if not in \texttt{\_TOOL\_CAPABLE} whitelist \\
+\hline
+8B models reject Agent 2 system prompt & Agent 2 system prompt exceeds 6,000-token context of small models & Registry learns capacity from 413 errors; skips model for oversized prompts \\
+\hline
+\end{tabular}
+\end{table}
+
+Several of these failures share a common pattern: a silent mismatch between a
+software assumption and the behaviour of an external system. The BOM bug assumed
+that Python's default codec handles all Unicode correctly on Windows.
+The TPD misclassification assumed that provider error strings follow a consistent
+format. The empty-file bug assumed that file existence implies valid content.
+In each case, the failure was invisible until triggered under live API conditions,
+confirming that empirical testing under real quota and encoding constraints is
+irreplaceable as a debugging method for multi-provider LLM pipelines.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Experimental Setup}
+\label{sec:setup}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Domain and Motivation}
+
+The experiment targets \textbf{Tunisian restaurants} food-service establishments
+across all Tunisian cities and price segments. This domain was selected for three reasons.
+First, it represents a local market with strongly heterogeneous international visibility:
+a small number of establishments are documented internationally while the majority remain
+unknown outside Tunisia, making the GEO visibility gap maximally observable.
+Second, the French-Arabic bilingual character of Tunisian online content provides a
+realistic test of cross-lingual entity normalisation.
+Third, published GEO research has focused almost exclusively on large English-language
+markets~\cite{aggarwal2023geo}; this study contributes the first analysis of a
+North African, Francophone context.
+
+\subsection{Prompt Set}
+
+The prompt set consists of 30 French-language queries covering six intent categories
+(Table~\ref{tab:prompts}), with five variants per intent.
+French was chosen to simulate the dominant digital interaction register of Tunisian users.
+Every prompt names a specific Tunisian city and uses superlative or ranking formulations
+(\textit{``Quel est le meilleur...''}, \textit{``Cite-moi les 3 plus connus...''})
+to ensure that responding LLMs produce named entity lists rather than generic descriptions.
+The set was validated by Agent~0's self-reflection mechanism, which confirmed 100\%
+brand-eliciting coverage and six balanced intent categories spanning informational,
+locational, and contextual query types.
+
+\begin{table}[H]
+\centering
+\caption{Prompt Set: Intent Categories and Examples}
+\label{tab:prompts}
+\begin{tabular}{|p{4cm}|p{4.7cm}|p{5.2cm}|}
+\hline
+\textbf{Intent} & \textbf{Description} & \textbf{Example Prompt} \\
+\hline
+\texttt{top\_recommendation} & Best restaurants by overall reputation & \textit{``Quel est le meilleur restaurant tunisien à Tunis ?''} \\
+\hline
+\texttt{cuisine\_authentique} & Traditional dish recommendations & \textit{``Quel restaurant est réputé pour son couscous à Tunis ?''} \\
+\hline
+\texttt{localisation} & Restaurants in a specific district & \textit{``Quels restaurants recommandes-tu dans le quartier La Marsa ?''} \\
+\hline
+\texttt{occasion\_speciale} & Context-specific venue recommendations & \textit{``Quel restaurant pour un dîner romantique à Tunis ?''} \\
+\hline
+\texttt{comparatif} & Explicit ranking and comparison & \textit{``Classe les 5 meilleurs restaurants tunisiens à Tunis.''} \\
+\hline
+\texttt{avis\_touristes} & Tourist-oriented queries & \textit{``Je suis touriste à Tunis, quel restaurant me recommandes-tu ?''} \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Query Configuration}
+
+Each prompt is evaluated across three model slots
+(\texttt{llama-small} 8B, \texttt{qwen-medium} 32B, \texttt{llama-large} 70B)
+for $R = 5$ independent runs each, yielding a planned total of:
+
+\[
+N \;=\; P \times S \times R \;=\; 30 \times 3 \times 5 \;=\; 450 \;\text{LLM queries}
+\]
+
+The three-tier model design allows the study to quantify whether entity visibility
+is consistent across model scale, or whether certain entities are known only to
+larger models. The five-run repetition supports mention stability estimation:
+an entity appearing in all five runs of a given (prompt, slot) pair exhibits high
+stability, while one appearing in a single run signals low-reliability visibility.
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Results}
+\label{sec:results}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+
+
+\subsection{Agent 0 Prompt Set Validation}
+
+
+\subsection{Agent 1 Response Collection and Entity Extraction}
+
+
+\subsection{Agent 2 Web Presence Research}
+
+
+
+\subsection{Agent 3  GEO Scoring and Visibility Ranking}
+
+
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+% ═══════════════════════════════════════════════════════════════════════════════
+
+\subsection{Architecture Validation}
+
+
+\subsection{Limitations}
+
+
+% ═══════════════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+% ═══════════════════════════════════════════════════════════════════════════════

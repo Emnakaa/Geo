@@ -194,8 +194,7 @@ def _sanitise(value) -> str:
         # Replace all whitespace control chars except regular space
         cleaned = value.replace("\n", " ").replace("\r", " ").replace("\t", " ")
         # Collapse multiple spaces from the replacement
-        import re as _re
-        cleaned = _re.sub(r" {2,}", " ", cleaned).strip()
+        cleaned = re.sub(r" {2,}", " ", cleaned).strip()
         return cleaned[:500]
     return str(value)
 
@@ -286,8 +285,8 @@ def _parse_row(text: str, entity: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Try extracting first {...} block
-    m = re.search(r"\{[\s\S]*?\}", clean)
+    # Try extracting first {...} block — greedy so nested objects are captured fully
+    m = re.search(r"\{[\s\S]*\}", clean)
     if m:
         try:
             data = json.loads(m.group())
@@ -333,23 +332,20 @@ def _make_llm(model_id: str, provider: str, api_key: str = ""):
 
 
 # Models known to support tool calling — in priority order.
-# Groq first (fastest, highest quality), then OpenRouter as fallback.
+# OpenRouter paid first (reliable tool calling, no TPD issues).
+# Groq as fallback (fast but daily quota limited).
 # Registry skips TPD-exhausted slots automatically — no hardcoded provider skip.
 _TOOL_CAPABLE = [
-    "llama-3.3-70b-versatile",              # Groq  — priority 1
-    "meta-llama/llama-3.3-70b-instruct",    # OpenRouter — priority 2
+    "anthropic/claude-3-haiku",             # OpenRouter paid — priority 1
+    "openai/gpt-4o-mini",                   # OpenRouter paid — priority 2
+    "meta-llama/llama-3.3-70b-instruct",    # OpenRouter
+    "google/gemini-flash-1.5",              # OpenRouter
     "mistralai/mistral-small",              # OpenRouter
     "mistralai/mistral-medium",             # OpenRouter
-    "anthropic/claude-3-haiku",             # OpenRouter
-    "openai/gpt-4o-mini",                   # OpenRouter
-    "google/gemini-flash-1.5",              # OpenRouter
     "qwen/qwen3-32b",                       # OpenRouter
+    "llama-3.3-70b-versatile",              # Groq — fallback
 ]
 
-def _batch_size(provider: str) -> int:
-    # All providers run sequentially (batch=1) to avoid TPM/RPM rate limits.
-    # Groq TPM=12k/min, parallel batches multiply token usage and cause 429s.
-    return 1
 
 
 async def _research_one(entity: str, tools: list,
@@ -463,8 +459,7 @@ async def _research_all_async(entities: list[str], initial_model: str,
     total   = len(entities)
     results = []
 
-    bsize = _batch_size(initial_provider)
-    print(f"[Agent2] Provider={initial_provider} model={initial_model} batch_size={bsize}")
+    print(f"[Agent2] Provider={initial_provider} model={initial_model}")
 
     # MCP client reconnects every N entities to avoid stdio connection timeout.
     # Reconnect interval: larger batches for fast providers, 4 for slow/free ones.
@@ -581,14 +576,23 @@ def run_agent2_node(state: PipelineState) -> PipelineState:
     """LangGraph node: runs Agent 2 (ReAct/MCP) and merges results into state."""
     errors = list(state.get("errors", []))
 
-    # Only research entities with at least 2 mentions — single-mention entities
-    # are likely hallucinations or noise; filtering them saves ~70% of Agent 2 calls.
-    entities = [
-        row["canonical_entity"]
-        for row in state.get("entity_features_global", [])
-        if row.get("canonical_entity") and (row.get("mention_count", 0) >= 2
-           or row.get("stability_score", 0) >= 0.05)
-    ]
+    # If the orchestrator injected a specific retry list (from Agent 3 LLM triage),
+    # use it directly — these have already been validated as real restaurants worth retrying.
+    # Otherwise apply the normal eligibility filter over entity_features_global.
+    if state.get("_retry_entities"):
+        entities = [
+            row["canonical_entity"]
+            for row in state["_retry_entities"]
+            if row.get("canonical_entity")
+        ]
+        print(f"[agent2] Retry mode: researching {len(entities)} LLM-triaged entities")
+    else:
+        entities = [
+            row["canonical_entity"]
+            for row in state.get("entity_features_global", [])
+            if row.get("canonical_entity") and (row.get("mention_count", 0) >= 2
+               or row.get("stability_score", 0) >= 0.05)
+        ]
 
     if not entities:
         errors.append("agent2: no entities in state - skipping")

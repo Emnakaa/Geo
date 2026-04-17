@@ -64,16 +64,12 @@ class SupervisorAgent:
         self._failure_history: dict[str, list[str]] = {}  # entity -> list of errors
 
     def _get_llm(self):
-        """Lazy-init a fast LLM for supervision decisions."""
-        if self._llm is not None:
-            return self._llm
-        # Use the best available model — supervisor reasoning is lightweight
+        """Select a fresh LLM for supervision on every call — registry skips exhausted slots."""
         try:
             model_id, provider, api_key = self._registry.select()
-            self._llm = (model_id, provider, api_key)
+            return (model_id, provider, api_key)
         except RuntimeError:
-            self._llm = None
-        return self._llm
+            return None
 
     def _llm_decide(self, error_message: str, model_id: str,
                     provider: str, attempt: int, entity: str = "") -> dict:
@@ -183,13 +179,6 @@ class SupervisorAgent:
         if "413" in msg and "tokens per minute" in msg:
             return {"action": "switch_model", "mark_exhausted": True,
                     "wait_seconds": 0, "reason": "413 TPM budget too small"}
-
-        # TPM rate limit — extract wait time
-        if "429" in msg and ("tokens per minute" in msg or "tpm" in msg):
-            m = re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)s", error_message)
-            wait = (int(m.group(1) or 0) * 60 + float(m.group(2))) if m else 30
-            return {"action": "wait_retry", "mark_exhausted": False,
-                    "wait_seconds": wait, "reason": f"TPM rate limit — wait {wait:.0f}s"}
 
         # TPM rate limit — extract wait time
         if "429" in msg and ("tokens per minute" in msg or "tpm" in msg

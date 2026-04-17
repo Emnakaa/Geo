@@ -2,11 +2,15 @@
 """Agent 0 - Intent discovery and prompt generation."""
 
 import os
+import sys
 import json
+import time
 import pandas as pd
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import MODEL_INTENT, MODEL_ANALYST2
 from llm_utils import call_llm
+from pipeline_state import PipelineState
 
 MODEL_1 = MODEL_INTENT
 MODEL_2 = MODEL_ANALYST2
@@ -17,14 +21,9 @@ def query_llm_structured(model: str, prompt: str, system: str = "") -> str:
     return call_llm(prompt=prompt, system=system, preferred_model=model,
                     max_completion_tokens=4096, temperature=0.2)
 
-import json
-import pandas as pd
-import time
 
 def agent0_generate_intents(domain: str, n_intents: int, model: str) -> list:
-    """
-    Step 1: LLM discovers relevant intent types for the given domain.
-    """
+    """Step 1: LLM discovers relevant intent types for the given domain."""
     system = """You are an expert in user behavior and search intent analysis, specialising in GEO (Generative Engine Optimization) research.
 Your job is to identify the most realistic and diverse intent types that users express when querying an AI assistant about a specific domain.
 
@@ -61,18 +60,14 @@ Respond ONLY with a JSON array like:
 ]"""
 
     response = query_llm_structured(model=model, prompt=prompt, system=system)
-
-    # clean response in case LLM adds markdown
     intents = parse_json_response(response, model, prompt, system)
-
     print(f"Agent 0, Step 1: {len(intents)} intents discovered")
     return intents
 
+
 def agent0_generate_prompts(domain: str, intents: list, languages: list,
                              n_variants: int, model: str) -> pd.DataFrame:
-    """
-    Step 2: For each intent, generate n_variants prompts per language.
-    """
+    """Step 2: For each intent, generate n_variants prompts per language."""
     system = """You are an expert in prompt engineering and multilingual NLP, specialising in GEO (Generative Engine Optimization) research.
 Your job is to generate realistic, diverse user queries that will reveal which specific brands or establishments an AI assistant knows.
 
@@ -125,22 +120,15 @@ Respond ONLY with a JSON array:
 
         response = query_llm_structured(model=model, prompt=prompt, system=system)
         variants = parse_json_response(response, model, prompt, system)
-
         all_prompts.extend(variants)
         print(f"Intent '{intent['intent_id']}'  {len(variants)} prompts generated")
-        time.sleep(0.5)  # avoid rate limiting
+        time.sleep(0.5)
 
-    # build DataFrame
-    df = pd.DataFrame(all_prompts)
-
-    # add prompt_id
-    df = df.reset_index(drop=True)
+    df = pd.DataFrame(all_prompts).reset_index(drop=True)
     df['prompt_id'] = ['P' + str(i+1).zfill(3) for i in range(len(df))]
-
-    # reorder columns
     df = df[['prompt_id', 'intent_id', 'language', 'variant_id', 'prompt_text']]
-
     return df
+
 
 def parse_json_response(response: str, model: str,
                         original_prompt: str, system: str,
@@ -152,8 +140,7 @@ def parse_json_response(response: str, model: str,
                      .removeprefix("```")
                      .removesuffix("```")
                      .strip())
-            return json.loads(clean) #json.loads() converts JSON string to Python object
-
+            return json.loads(clean)
         except json.JSONDecodeError as e:
             print(f"JSON parse failed (attempt {attempt+1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
@@ -162,21 +149,15 @@ Error: {e}
 Your response was:
 {response}
 Fix it and return ONLY valid JSON, nothing else."""
-                response = query_llm_structured(
-                    model=model,
-                    prompt=fix_prompt,
-                    system=system
-                )
+                response = query_llm_structured(model=model, prompt=fix_prompt, system=system)
             else:
                 print(f"[ERROR] Failed to parse JSON after {max_retries} attempts - returning empty list")
                 return []
 
+
 def agent0_reflect(domain: str, intents: list,
                    prompts_df: pd.DataFrame, model: str) -> dict:
-    """
-    Agent reflects on its own output quality before passing to Agent 1.
-    Returns quality report + decision to proceed or regenerate.
-    """
+    """Step 3: Self-reflection — evaluates prompt set quality, returns proceed decision."""
     system = """You are a critical evaluator of prompt sets for NLP research.
     Respond in valid JSON only."""
 
@@ -220,6 +201,7 @@ Respond ONLY with:
 
     return report
 
+
 def agent0_run(domain: str, model: str, languages: list = ["fr", "ar"],
                n_intents: int = 4, n_variants: int = 3,
                max_reflection_loops: int = 2) -> pd.DataFrame:
@@ -229,52 +211,31 @@ def agent0_run(domain: str, model: str, languages: list = ["fr", "ar"],
     for loop in range(max_reflection_loops):
         print(f"\nLoop {loop + 1}/{max_reflection_loops}")
 
-        # 1: discover intents
-        intents = agent0_generate_intents(
-            domain=domain, n_intents=n_intents, model=model
-        )
-
-        # 2: generate prompts
-        prompt_df = agent0_generate_prompts(
-            domain=domain, intents=intents,
-            languages=languages, n_variants=n_variants, model=model
-        )
-
-        # 3:self reflection
-        report = agent0_reflect(
-            domain=domain, intents=intents,
-            prompts_df=prompt_df, model=model
-        )
+        intents   = agent0_generate_intents(domain=domain, n_intents=n_intents, model=model)
+        prompt_df = agent0_generate_prompts(domain=domain, intents=intents,
+                                            languages=languages, n_variants=n_variants, model=model)
+        report    = agent0_reflect(domain=domain, intents=intents, prompts_df=prompt_df, model=model)
 
         if report['proceed']:
             print(f"\n Agent 0 satisfied with output at loop {loop+1}")
             break
         else:
             print(f"\n Agent 0 not satisfied - regenerating...")
-            # inject missing intents into next loop
             n_intents = n_intents + len(report.get('missing_intents', []))
-
-
     else:
         print(f"\n Agent 0 reached max loops - saving best available output")
 
     output_path = f"prompt_set_{domain.replace(' ', '_')}.csv"
-    if not os.path.exists(output_path):  # never overwrite a pre-built prompt set
+    if not os.path.exists(output_path):
         prompt_df.to_csv(output_path, index=False, encoding='utf-8-sig')
     print(f"\n Agent 0 complete - {len(prompt_df)} prompts -> '{output_path}'")
     return prompt_df
-
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from pipeline_state import PipelineState
 
 
 def run_agent0_node(state: PipelineState) -> PipelineState:
     """LangGraph node: runs Agent 0 and merges results into state."""
     errors = list(state.get("errors", []))
     try:
-        # If a pre-built prompt set exists, load it directly instead of regenerating
         output_path = f"prompt_set_{state['domain'].replace(' ', '_')}.csv"
         if os.path.exists(output_path):
             prompt_df = pd.read_csv(output_path, encoding='utf-8-sig')
@@ -295,7 +256,7 @@ def run_agent0_node(state: PipelineState) -> PipelineState:
 
     return {
         **state,
-        "prompt_set":  prompt_set,
-        "errors":      errors,
+        "prompt_set":   prompt_set,
+        "errors":       errors,
         "current_step": "agent0",
     }

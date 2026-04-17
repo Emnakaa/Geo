@@ -1,0 +1,765 @@
+\selectlanguage{english}
+\chapter{System Design, Architecture, and Results}
+\label{chap:design}
+\renewcommand{\chaptername}{Chapter}
+
+\section*{Introduction}
+\addcontentsline{toc}{section}{\textbf{Introduction}}
+
+This chapter presents the design, architecture, and preliminary results of the
+proposed GEO measurement pipeline. It establishes the research approach and core
+design decisions, then describes each component in detail: the dynamic model
+registry, and the four specialized agents with their internal workflows. The chapter
+concludes with preliminary evaluation results and a discussion of observed
+limitations.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Research Approach and Design Philosophy}
+% ─────────────────────────────────────────────────────────────────────────────
+
+This project follows a \textbf{design science research} methodology
+\cite{hevner2004design}: the primary contribution is a working software artifact
+evaluated against the problem it was designed to solve. The approach involves
+iterative construction and empirical evaluation --- each component is built, tested
+under real API conditions, measured for output quality, and refined before the next
+is designed. Three principles guided all architectural decisions.
+
+\textbf{Autonomy over prescription:} the system makes its own decisions about which
+model to use, which data source to query, and how to recover from failures ---
+without human intervention at runtime. This ruled out fixed execution graphs in
+favor of an orchestrator that reasons about the current state and selects the next
+action dynamically.
+
+\textbf{Resilience over speed:} the pipeline operates under constrained conditions
+--- free-tier API quotas, variable rate limits, and tool servers that may time out.
+The system must checkpoint progress and resume without data loss, motivating the
+per-model state tracking in the model registry.
+
+\textbf{Reproducibility over convenience:} all outputs are saved in structured CSV
+files with fixed schemas. Intermediate outputs from each agent are preserved
+separately so any stage can be re-run without repeating earlier stages.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{System Overview}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The pipeline is organized into four sequential stages, each handled by a dedicated
+agent, coordinated by an orchestration layer, and supported by a dynamic model
+registry shared across all agents. Figure~\ref{fig:system_overview} presents the
+full system architecture.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  agent/.style={
+    rectangle, rounded corners=5pt,
+    draw=blue!65, fill=blue!8,
+    text width=3.4cm, align=center,
+    font=\small\bfseries, minimum height=1.0cm},
+  orch/.style={
+    rectangle, rounded corners=6pt,
+    draw=violet!70, fill=violet!8,
+    text width=2.4cm, align=center,
+    font=\small\bfseries, minimum height=1.0cm},
+  csv/.style={
+    rectangle, rounded corners=3pt,
+    draw=gray!55, fill=gray!5,
+    text width=3.4cm, align=center,
+    font=\scriptsize\itshape, minimum height=0.85cm},
+  registry/.style={
+    rectangle, rounded corners=5pt,
+    draw=orange!70, fill=orange!8,
+    text width=3.2cm, align=center,
+    font=\small\bfseries, minimum height=0.9cm},
+  provider/.style={
+    rectangle, rounded corners=3pt,
+    draw=red!40, fill=red!5,
+    text width=2.8cm, align=center,
+    font=\scriptsize, minimum height=0.6cm},
+  mcp/.style={
+    rectangle, rounded corners=3pt,
+    draw=teal!60, fill=teal!7,
+    text width=3.0cm, align=center,
+    font=\scriptsize, minimum height=0.6cm},
+  %% Arrow styles
+  arrow/.style={-{Stealth[length=5pt]}, thick},
+  darrow/.style={-{Stealth[length=4pt]}, thick, dashed, gray!60},
+  oarrow/.style={-{Stealth[length=4pt]}, thick, orange!70},
+  tarrow/.style={-{Stealth[length=4pt]}, thick, teal!65},
+  earrow/.style={-{Stealth[length=4pt]}, thick, violet!65},
+]
+
+%% ═══════════════════════════════════════════════════════════════════════════
+%% COLUMN POSITIONS
+%%   Orchestrator  : x = -4.5   (left coordinator column)
+%%   Agent column  : x =  0      (span: -1.7 to +1.7)
+%%   CSV column    : x =  5.5    (span:  3.8 to  7.2)
+%%   Routing lane  : x =  3.0    (gap between agent.east=1.7 and csv.west=3.8)
+%%   Right column  : x =  9.8    (registry, providers, MCP)
+%% ROW POSITIONS: y = 0, -3.5, -7.0, -10.5
+%% ═══════════════════════════════════════════════════════════════════════════
+
+%% ── Orchestrator (left column, vertically centered) ─────────────────────────
+\node[orch] (orch) at (-4.5, -5.25) {Orchestrator\\{\footnotesize\normalfont orchestrator.py}};
+
+%% ── Agents ──────────────────────────────────────────────────────────────────
+\node[agent] (a0) at (0,    0)    {Agent 0\\{\footnotesize\normalfont Intent \& Prompts}};
+\node[agent] (a1) at (0,   -3.5) {Agent 1\\{\footnotesize\normalfont Query \& Extract}};
+\node[agent] (a2) at (0,   -7.0) {Agent 2\\{\footnotesize\normalfont Web Research}};
+\node[agent] (a3) at (0,  -10.5) {Agent 3\\{\footnotesize\normalfont Merge \& Score}};
+
+%% ── CSV checkpoints ─────────────────────────────────────────────────────────
+\node[csv] (c0) at (5.5,    0)   {\texttt{prompt\_set.csv}\\{\tiny intents, prompts, language}};
+\node[csv] (c1) at (5.5,  -3.5) {\texttt{entity\_features\_global.csv}\\{\tiny entities, mention\_rate, stability}};
+\node[csv] (c2) at (5.5,  -7.0) {\texttt{web\_features.csv}\\{\tiny ratings, social, wikipedia}};
+\node[csv] (c3) at (5.5, -10.5) {\texttt{enriched\_entities.csv}\\{\tiny all features + geo\_score}};
+
+%% ── Model Registry + Providers (right column, rows 0–1 area) ────────────────
+\node[registry] (reg)  at (9.8, -1.0)  {Dynamic Model\\Registry};
+\node[provider] (groq) at (9.8, -2.5)  {Groq API};
+\node[provider] (or)   at (9.8, -3.6)  {OpenRouter};
+\node[provider] (mist) at (9.8, -4.7)  {Mistral API};
+
+%% ── MCP Tool Servers (right column, row 2 area) ─────────────────────────────
+\node[mcp] (mcp1) at (9.8, -6.2)  {Search Server\\{\tiny Maps · TA · DDG}};
+\node[mcp] (mcp2) at (9.8, -7.2)  {Scrape Server\\{\tiny Instagram · Apify}};
+\node[mcp] (mcp3) at (9.8, -8.2)  {Wiki Server\\{\tiny Wikipedia EN/FR}};
+
+%% ═══════════════════════════════════════════════════════════════════════════
+%% ARROWS
+%% ═══════════════════════════════════════════════════════════════════════════
+
+%% 0. Orchestrator → Agents  (sequential calls — fixed pipeline order)
+%%    Route: orch.east → horizontal to x=-2.1, then bend down/up to each agent.west
+\draw[earrow] (orch.east) -| (a0.west)
+  node[near end, left, font=\scriptsize, violet!70] {(1)};
+\draw[earrow] (orch.east) -| (a1.west)
+  node[near end, left, font=\scriptsize, violet!70] {(2)};
+\draw[earrow] (orch.east) -| (a2.west)
+  node[near end, left, font=\scriptsize, violet!70] {(3)};
+\draw[earrow] (orch.east) -| (a3.west)
+  node[near end, left, font=\scriptsize, violet!70] {(4)};
+
+%% 1. Agent → CSV  (horizontal writes, same row — always clear)
+\draw[arrow] (a0.east) -- (c0.west)
+  node[midway, above, font=\scriptsize] {writes};
+\draw[arrow] (a1.east) -- (c1.west)
+  node[midway, above, font=\scriptsize] {writes};
+\draw[arrow] (a2.east) -- (c2.west)
+  node[midway, above, font=\scriptsize] {writes};
+\draw[arrow] (a3.east) -- (c3.west)
+  node[midway, above, font=\scriptsize] {writes};
+
+%% 2. CSV → next Agent  (sequential data feeds)
+%%    Route: csv.south ↓ into the inter-row gap → left → agent.east
+%%    All horizontals sit in clear inter-row gaps (no nodes there)
+
+%% c0 → a1  (gap at y ≈ -1.75)
+\draw[darrow]
+  (c0.south) -- ++(0,-1.3) -| (a1.east)
+  node[near start, right, font=\scriptsize, gray!70] {reads};
+
+%% c1 → a2  (gap at y ≈ -5.25)
+\draw[darrow]
+  (c1.south) -- ++(0,-1.3) -| (a2.east);
+
+%% c2 → a3  (gap at y ≈ -8.75)
+\draw[darrow]
+  (c2.south) -- ++(0,-1.3) -| (a3.east);
+
+%% 3. c1 → a3  (Agent 3 also reads Agent 1 output — bypass via routing lane)
+%%    Routing lane at x=3.0: between agent.east (1.7) and csv.west (3.8) — no nodes
+\draw[darrow, gray!45]
+  (c1.west)
+    -- (3.0, -3.5)   %% enter the routing lane at row-1 level
+    -- (3.0, -10.5)  %% descend to row-3 level (no nodes at x=3.0)
+    -- (a3.east)
+  node[near start, left, font=\scriptsize, gray!55] {also reads};
+
+%% 4. Registry → LLM Providers  (downward within right column — always clear)
+\draw[oarrow] (reg.south)  -- (groq.north);
+\draw[oarrow] (groq.south) -- (or.north);
+\draw[oarrow] (or.south)   -- (mist.north);
+
+%% 5. Registry → Agent 1 and Agent 2  (model selection)
+%%    Route: reg.west → routing lane (x=3.0) → agent.east
+%%    Horizontal leg stays in the inter-row gap; vertical leg in clear lane
+
+%% reg → a1: horizontal at y=-1.0 (between row-0 and row-1, no csv nodes there)
+\draw[oarrow]
+  (reg.west)
+    -- (3.1, -1.0)   %% reach the routing lane at a clear y level
+    -- (3.1, -3.5)   %% descend to row-1 in the lane
+    -- (a1.east)
+  node[near end, above, font=\scriptsize, orange!80] {model};
+
+%% reg → a2: horizontal at y=-1.0 same entry, continues down to row-2
+\draw[oarrow]
+  (reg.west)
+    -- (2.9, -1.0)   %% slightly offset to avoid exact overlap with reg→a1
+    -- (2.9, -7.0)   %% descend to row-2 in the lane
+    -- (a2.east);
+
+%% 6. Agent 2 ↔ MCP Tool Servers
+%%    Route: a2.east → ++(1.5,0) — reaching x=1.7+1.5=3.2 (in the lane)
+%%    then right to MCP, staying above csv.south and below next row
+\draw[tarrow]
+  (a2.east) -- ++(2.0,0) |- (mcp1.west)
+  node[near start, above, font=\scriptsize, teal!70] {tool calls};
+\draw[tarrow] (a2.east) -- ++(2.0,0) |- (mcp2.west);
+\draw[tarrow] (a2.east) -- ++(2.0,0) |- (mcp3.west);
+
+%% ── Grouping boxes ──────────────────────────────────────────────────────────
+\node[draw=teal!40, dashed, rounded corners=5pt,
+      fit=(mcp1)(mcp2)(mcp3), inner sep=4pt,
+      label={[font=\scriptsize\itshape, teal!60]above:MCP Tool Servers}] {};
+
+\node[draw=red!30, dashed, rounded corners=5pt,
+      fit=(groq)(or)(mist), inner sep=4pt,
+      label={[font=\scriptsize\itshape, red!40]above:LLM Providers}] {};
+
+\end{tikzpicture}
+\caption{GEO pipeline data flow. The orchestrator (\texttt{orchestrator.py})
+drives the four agents in fixed sequential order (1)–(4). Each agent reads its
+input from the upstream CSV checkpoint and writes its output to the next.
+Agent~3 merges both Agent~1 and Agent~2 outputs using fuzzy entity matching,
+then applies LLM-based deduplication and entity triage.
+Agents~1 and~2 query the dynamic model registry for the best available
+(model, provider, key) triple at each inference call. Agent~2 performs all
+web data collection exclusively through the three MCP tool servers.}
+\label{fig:system_overview}
+\end{figure}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Dynamic Model Registry}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Operating across multiple free-tier LLM providers requires managing heterogeneous
+and frequently binding quota constraints. The \textbf{dynamic model registry}
+maintains a continuously updated state for every available model slot and selects
+the best available option autonomously at each inference call --- eliminating the
+need for hardcoded fallback chains.
+
+At pipeline startup, the registry queries the model listing APIs of Groq, OpenRouter,
+and Mistral, constructing a pool of slots identified by
+\texttt{provider:keyIndex/model\_id}. Each slot is assigned a capability tier
+(Table~\ref{tab:model_tiers}) and maintains three runtime states: \textbf{TPD
+exhaustion} (daily quota hit --- permanent, persisted to disk across restarts),
+\textbf{TPM block} (per-minute rate limit --- temporary, cleared when the retry
+window expires), and \textbf{learned token capacity} (set on 413 errors --- used to
+pre-filter the model for oversized prompts, eliminating repeated failures without
+manual configuration).
+
+\begin{table}[H]
+\centering
+\caption{Model capability tiers used for selection ranking.}
+\label{tab:model_tiers}
+\begin{tabular}{|c|p{3.2cm}|p{8.3cm}|}
+\hline
+\textbf{Tier} & \textbf{Quality Level} & \textbf{Identifying Keywords} \\
+\hline
+0 & Highest   & 70b, 72b, 120b, llama-4, qwen3-32b, claude-3.5, deepseek-r1 \\
+\hline
+1 & Medium    & 32b, 27b, 14b, gemini-flash, mistral-small, claude-3-haiku \\
+\hline
+2 & Lightweight & 8b, 7b, 3b, instant, mini, nano \\
+\hline
+\end{tabular}
+\end{table}
+
+The \texttt{select(preferred, estimated\_tokens)} method ranks candidates by tier,
+provider, and key index --- but the pool it operates on evolves autonomously at
+runtime. Three state transitions shape it without human intervention:
+\texttt{mark\_tpd\_exhausted()} permanently removes a slot when its daily quota is
+hit (persisted across restarts), \texttt{mark\_tpm()} blocks a slot until its
+rate-limit window expires, and \texttt{mark\_too\_large()} records a learned
+token-capacity ceiling on 413 errors so oversized prompts skip that model
+automatically. The pipeline thus always selects the best \textit{currently usable}
+model for the prompt at hand --- \textbf{adaptive autonomous selection} driven
+entirely by the system's own API observations. The error-classification logic that
+triggers these transitions lives in the Supervisor Agent
+(Section~\ref{sec:supervisor}), described next.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Pipeline Agents}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Agent 0: Intent Discovery and Prompt Generation}
+
+A single query formulation such as ``best restaurants in Tunis'' would produce
+results sensitive to the experimenter's specific phrasing. Agent~0 addresses this
+by autonomously generating a diverse prompt set covering multiple user intents and
+linguistic variants, ensuring that downstream visibility metrics reflect robust
+entity representation across a broad query space.
+
+The generation pipeline consists of three steps. \textbf{Step 1 --- Intent
+discovery:} given a domain description and target language, an LLM identifies
+the distinct query intents a real user might have (e.g.\ recommendation requests,
+occasion-based searches, comparison queries, information lookup). The number of
+intents is controlled by the \texttt{n\_intents} parameter; the result is a
+validated JSON taxonomy stored in the pipeline state. \textbf{Step 2 --- Prompt
+generation:} for each intent and each target language (French and Arabic in this study),
+\texttt{n\_variants} distinct formulations are generated using varied vocabulary,
+sentence structure, and specificity level, simulating natural multilingual user
+variation. \textbf{Step 3 --- Self-reflection:} the LLM evaluates the \textit{entire} prompt
+set against quality criteria: intent diversity, linguistic naturalness, and a
+GEO-specific constraint requiring that at least 60\% of prompts force the AI to
+name specific establishments (using superlatives, rankings, or explicit citation
+requests). If the set fails (\texttt{proceed: false}), the whole generation is
+restarted with the missing intents added to \texttt{n\_intents}; the loop runs at
+most \texttt{max\_reflection\_loops} times (default~2). The final set is saved to
+\texttt{prompt\_set.csv}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=blue!60, fill=blue!8,
+              text width=3.8cm, align=center, font=\small, minimum height=1.0cm},
+  decision/.style={rectangle, rounded corners=4pt, draw=orange!70, fill=orange!8,
+                   text width=3.0cm, align=center, font=\scriptsize,
+                   minimum height=0.8cm},
+  arrow/.style={-{Stealth[length=5pt]}, thick},
+  io/.style={rectangle, rounded corners=4pt, draw=green!60!black, fill=green!7,
+             text width=3.4cm, align=center, font=\small, minimum height=0.8cm},
+]
+\node[io]       (input)   at (0, 0)    {Domain + Language\\+ Parameters};
+\node[box]      (intents) at (0, -2.0) {Step 1 --- Intent Discovery\\{\footnotesize LLM intent taxonomy}};
+\node[box]      (prompts) at (0, -4.0) {Step 2 --- Prompt Generation\\{\footnotesize n\_variants per intent}};
+\node[box]      (reflect) at (0, -6.0) {Step 3 --- Self-Reflection\\{\footnotesize quality scoring}};
+\node[decision] (check)   at (0, -8.0) {All prompts pass\\quality threshold?};
+\node[io]       (output)  at (5.5, -8.0) {\texttt{prompt\_set.csv}};
+\draw[arrow] (input)   -- (intents);
+\draw[arrow] (intents) -- (prompts);
+\draw[arrow] (prompts) -- (reflect);
+\draw[arrow] (reflect) -- (check);
+\draw[arrow] (check.east) -- (output.west)
+  node[midway, above, font=\scriptsize] {Yes};
+\draw[arrow] (check.west) -- ++(-2.5, 0) |- (prompts.west)
+  node[near start, left, font=\scriptsize, align=center] {No\\regenerate};
+\end{tikzpicture}
+\caption{Agent~0 workflow: intent discovery, prompt generation, and self-reflection
+quality control. Low-quality prompts trigger a targeted regeneration loop.}
+\label{fig:agent0_flow}
+\end{figure}
+
+\subsection{Agent 1: LLM Querying and Entity Extraction}
+
+Agent~1 is responsible for the core GEO measurement task: submitting the generated
+prompts to multiple LLMs across independent runs, extracting the named entities
+mentioned in each response, and computing visibility metrics that quantify how
+consistently each entity appears across the full prompt, model, and run space.
+
+\textbf{Step 2 --- Multi-model querying.} Each prompt is submitted to every
+model slot in the \texttt{QUERY\_MODELS} configuration, repeated \texttt{n\_runs}
+times per slot. This cross-model, multi-run design is the core of GEO measurement:
+entity visibility is only meaningful when aggregated across diverse LLMs and
+phrasing variants, not a single model call. All responses are appended
+progressively to \texttt{raw\_responses.csv} with resume support.
+
+\textbf{Step 3 --- Zero-shot entity extraction.} A dedicated Mistral extractor
+(fixed model, temperature~0) processes each raw response with a detailed system
+prompt specifying domain scope (Tunisian establishments only), normalization rules
+(lowercase, strip generic prefixes), and output format (flat JSON string array).
+The extractor returns entity names only --- no confidence scores --- along with the
+text block describing each entity for downstream context.
+
+\textbf{Step 4 --- Enrichment.} For each extracted entity, two structural features
+are computed: \textbf{ranking position} (the order in which the entity first
+appeared in the response, extracted via a second LLM call over the ranked list) and
+\textbf{description length in tokens} (estimated from the character ratio of the
+entity's description block to the full response).
+
+\textbf{Step 5 --- Five-phase cleaning pipeline.}
+(A)~\textbf{Hard pre-filtering} drops empty, too-short ($<$3 chars), numeric, and
+singleton entries (mention count $<$ 2) --- singletons are noise, not signal.
+(B)~\textbf{Fuzzy clustering} (RapidFuzz, threshold~88) groups high-similarity
+names; the most frequent variant in each cluster becomes the canonical form.
+(C)~\textbf{LLM arbitration} resolves ambiguous pairs (similarity 75--87) and
+simultaneously validates every entity: entities that are generic descriptors, wrong
+geography, or lack Tunisian context are invalidated.
+(D)~\textbf{Self-reflection} reviews all cleaning decisions and immediately applies
+corrections --- undoing incorrect merges or invalidations flagged as suspicious.
+(E)~\textbf{Mapping application} writes the final canonical names, quality flags,
+and null-rank penalties to \texttt{clean\_entities.csv}.
+
+\textbf{Step 6 --- GEO metric computation.} Three visibility metrics are computed
+per canonical entity across all responses: \textbf{mention rate} (fraction of
+valid responses in which the entity appeared), \textbf{stability score}
+($\text{mention\_rate} \times \frac{1}{1+\text{rank\_variance}}$, combining
+frequency with positional consistency), and a \textbf{consistency label}
+(\textit{stable} $\geq$~0.75, \textit{variable} $\geq$~0.40, \textit{unstable}
+otherwise). Entities with fewer than 2 mentions are excluded at Phase~A; the
+stability threshold for Agent~2 eligibility is applied by the orchestrator.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=blue!60, fill=blue!8,
+              text width=4.0cm, align=center, font=\small, minimum height=1.0cm},
+  arrow/.style={-{Stealth[length=5pt]}, thick},
+  io/.style={rectangle, rounded corners=4pt, draw=green!60!black, fill=green!7,
+             text width=3.4cm, align=center, font=\small, minimum height=0.8cm},
+]
+\node[io]  (input)   at (0, 0)     {\texttt{prompt\_set.csv}};
+\node[box] (query)   at (0, -2.0)  {Step 2 --- Multi-model Querying\\{\footnotesize QUERY\_MODELS $\times$ n\_runs}};
+\node[box] (extract) at (0, -4.0)  {Step 3 --- Entity Extraction\\{\footnotesize Mistral, flat JSON, names only}};
+\node[box] (enrich)  at (0, -6.0)  {Step 4 --- Enrichment\\{\footnotesize ranking position + desc.\ length}};
+\node[box] (clean)   at (0, -8.0)  {Step 5 --- Cleaning (A--E)\\{\footnotesize hard rules · fuzzy · LLM · reflect}};
+\node[box] (metrics) at (0, -10.0) {Step 6 --- GEO Metrics\\{\footnotesize mention rate, stability score}};
+\node[io]  (output)  at (0, -12.0) {\texttt{entity\_features\_global.csv}};
+\draw[arrow] (input)   -- (query);
+\draw[arrow] (query)   -- (extract)
+  node[midway, right, font=\scriptsize] {\texttt{raw\_responses.csv}};
+\draw[arrow] (extract) -- (enrich)
+  node[midway, right, font=\scriptsize] {\texttt{extracted\_entities.csv}};
+\draw[arrow] (enrich)  -- (clean)
+  node[midway, right, font=\scriptsize] {\texttt{enriched\_entities.csv}};
+\draw[arrow] (clean)   -- (metrics)
+  node[midway, right, font=\scriptsize] {\texttt{clean\_entities.csv}};
+\draw[arrow] (metrics) -- (output);
+\end{tikzpicture}
+\caption{Agent~1 workflow: multi-model querying, entity extraction, enrichment,
+five-phase cleaning, and GEO metric computation. Each intermediate output is
+checkpointed to CSV for resume support.}
+\label{fig:agent1_flow}
+\end{figure}
+
+\subsection{Agent 2: Web Presence Research}
+
+Agent~2 is the most technically complex component. For each entity meeting the
+visibility threshold, it operates as a fully autonomous ReAct agent over three
+MCP tool servers --- at each step it produces a \textit{thought} about what
+information has been gathered so far, selects a \textit{tool invocation} as its
+\textit{action}, and incorporates the tool's response as an \textit{observation}
+before deciding the next step.
+
+The agent follows a \textbf{prescribed 8-step research protocol} defined in its
+system prompt: (1)~\texttt{google\_maps\_search}, (2)~\texttt{wikipedia\_lookup},
+(3)~\texttt{tripadvisor\_search}, (4)~\texttt{wikidata\_lookup}, then conditionally:
+(5)~\texttt{extract\_website\_socials} if a website was found, (6)~\texttt{scrape\_instagram}
+if an Instagram handle was found, (7)~\texttt{scrape\_facebook} if a Facebook handle
+was found, and (8)~\texttt{ddg\_search} if no social presence was located. Steps 1--4
+always execute in order; steps 5--8 depend on what earlier steps returned.
+The ReAct loop provides adaptive handling of tool failures and observations, but the
+sequence of data targets is fixed.
+
+The four MCP servers expose the tools described in Table~\ref{tab:mcp_tools}. The
+protocol collects data across six categories (Google Maps, TripAdvisor, Wikipedia,
+Wikidata, Instagram, Facebook) and enforces geographic anchoring: every search query
+must include ``Tunisia'' or a Tunisian city name, and any result referencing a
+non-Tunisian geographic context is discarded and the search retried with more
+specific terms.
+
+\begin{table}[H]
+\centering
+\caption{MCP tool servers and their exposed tools.}
+\label{tab:mcp_tools}
+\begin{tabular}{|p{2.5cm}|p{3.5cm}|p{7.2cm}|}
+\hline
+\textbf{Server} & \textbf{Tool} & \textbf{Description} \\
+\hline
+\multirow{3}{*}{search\_server}
+  & \texttt{google\_maps\_search}      & Rating, review count, address, phone, website. Rotates through a pool of SerpAPI keys. \\
+\cline{2-3}
+  & \texttt{tripadvisor\_search}       & Two-step: web search locates the TA page URL, then scraper extracts rating and ranking. \\
+\cline{2-3}
+  & \texttt{ddg\_search}               & General DuckDuckGo search returning titles, URLs, snippets. \\
+\hline
+\multirow{3}{*}{scrape\_server}
+  & \texttt{scrape\_instagram}         & Follower count, post count, biography via Apify. Rotates through 5 Apify tokens. \\
+\cline{2-3}
+  & \texttt{scrape\_facebook}          & Page likes and average post engagement via Apify. \\
+\cline{2-3}
+  & \texttt{extract\_website\_socials} & Extracts Instagram/Facebook handles from a business website's HTML. \\
+\hline
+wiki\_server
+  & \texttt{wikipedia\_lookup}         & Queries the Wikipedia API in English and French; returns boolean presence and URL. \\
+\hline
+enrichment\_server
+  & \texttt{wikidata\_lookup}          & Queries the Wikidata API; returns entity type, country, founded date, and official website. \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection*{Supervisor Agent}
+\label{sec:supervisor}
+
+API errors are handled by the \textbf{Supervisor Agent} --- a rule-based error
+classifier with an optional LLM escalation path --- that inspects each error message
+and returns a structured recovery decision
+with four possible actions: \texttt{switch\_model} (billing or quota exhaustion ---
+mark slot TPD-exhausted), \texttt{wait\_retry} (rate limit --- wait the extracted
+retry-after duration), \texttt{retry} (transient 5xx --- retry immediately), or
+\texttt{skip} (unrecoverable after 4 attempts). Internally, the supervisor first
+attempts to call a lightweight LLM on the error text; if that call fails or times
+out, it falls back to a deterministic \texttt{if/elif} chain that encodes the same
+classification rules explicitly. In practice the LLM and the fallback produce
+identical decisions for the structured error codes that providers return --- the LLM
+path adds resilience for novel or ambiguous error messages, not a fundamentally
+different decision process. Each successfully processed entity is immediately
+checkpointed to \texttt{web\_features.csv}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=4pt, draw=blue!60, fill=blue!8,
+              text width=3.6cm, align=center, font=\small, minimum height=1.0cm},
+  supervisor/.style={rectangle, rounded corners=4pt, draw=red!50, fill=red!6,
+              text width=3.2cm, align=center, font=\small, minimum height=1.0cm},
+  mcp/.style={rectangle, rounded corners=4pt, draw=teal!60, fill=teal!7,
+              text width=3.2cm, align=center, font=\small, minimum height=1.0cm},
+  io/.style={rectangle, rounded corners=4pt, draw=green!60!black, fill=green!7,
+             text width=3.2cm, align=center, font=\small, minimum height=0.8cm},
+  arrow/.style={-{Stealth[length=5pt]}, thick},
+]
+\node[io]         (input)  at (0, 0)     {Entity Name + Context};
+\node[box]        (think)  at (0, -2.0)  {Thought\\Reason about gathered data};
+\node[box]        (act)    at (0, -4.0)  {Action\\Select \& invoke MCP tool};
+\node[mcp]        (mcp)    at (5.0, -4.0){MCP Tool Servers\\Search · Scrape · Wiki · Enrichment};
+\node[box]        (obs)    at (0, -6.0)  {Observation\\Parse \& validate result};
+\node[box]        (check)  at (0, -8.0)  {Sufficient data\\collected?};
+\node[supervisor] (sup)    at (5.0, -6.5){Supervisor Agent\\Classify error\\Return action};
+\node[io]         (output) at (0, -10.5) {\texttt{web\_features.csv}};
+\draw[arrow] (input)  -- (think);
+\draw[arrow] (think)  -- (act);
+\draw[arrow] (act.east)  -- (mcp.west)  node[midway, above, font=\scriptsize] {tool call};
+\draw[arrow] (mcp.west)  -- (obs.east)  node[midway, below, font=\scriptsize] {result};
+\draw[arrow] (obs)    -- (check);
+\draw[arrow] (check.west) -- ++(-2.2, 0) |- (think.west)
+  node[near start, left, font=\scriptsize, align=center] {No\\next step};
+\draw[arrow] (check.south) -- (output)  node[midway, right, font=\scriptsize] {Yes};
+\draw[arrow, red!50, dashed] (obs.east)  -- (sup.west)
+  node[midway, above, font=\scriptsize] {on error};
+\draw[arrow, red!50, dashed] (sup.north) -- ++(0, 0.6) -| (act.east)
+  node[near start, right, font=\scriptsize, align=center] {retry /\\switch model};
+\end{tikzpicture}
+\caption{Agent~2 ReAct processing loop. The agent iterates
+Thought--Action--Observation cycles over MCP tool servers until sufficient web
+presence data has been collected. All errors are handled by the Supervisor Agent,
+which reasons about the failure type and returns a structured recovery action
+without terminating the loop.}
+\label{fig:agent2_flow}
+\end{figure}
+
+\subsection{Agent 3: Merge, Deduplication, and Agentic Triage}
+
+Agent~3 is the final stage of the pipeline. It joins the LLM visibility metrics
+from Agent~1 with the web presence features from Agent~2 using a three-stage fuzzy
+matching strategy (exact normalized match, substring containment, then word overlap),
+with Agent~1 as the source of truth so that every extracted entity is retained.
+
+Two LLM-based reasoning steps then clean the merged dataset. First,
+\textbf{deduplication}: entities are grouped by shared content words (stop words
+such as \textit{le, la, de, el, dar} removed) and each candidate group is submitted
+to the LLM to decide whether the rows refer to the same place. Confirmed duplicates
+are merged --- mention counts summed, the richer web-data row kept.
+Second, \textbf{triage}: entities for which Agent~2 found no web evidence are
+classified by the LLM as \textit{retry} (real restaurant, missed by Agent~2),
+\textit{hallucination}, \textit{non\_restaurant}, or \textit{generic}.
+Non-viable entities are removed and saved to \texttt{rejected\_entities.csv};
+\textit{retry} entities are written to the merge report so the orchestrator can
+re-invoke Agent~2 on them.
+
+Finally, Agent~3 computes a \textbf{data-completeness score} (fraction of ten key
+fields that are non-null) and assigns a \textbf{unified quality} label
+(\textit{complete}, \textit{partial}, \textit{sparse}, or \textit{agent2\_failed})
+to each row. The result is saved to \texttt{unified\_features.csv}.
+Table~\ref{tab:output_schema} lists the key output fields.
+
+\begin{table}[H]
+\centering
+\caption{Key fields in the final output dataset (\texttt{unified\_features.csv}).}
+\label{tab:output_schema}
+\begin{tabular}{|p{3.8cm}|p{2.2cm}|p{7.2cm}|}
+\hline
+\textbf{Field} & \textbf{Source} & \textbf{Description} \\
+\hline
+\texttt{canonical\_entity}   & Agent 1 & Normalized entity name \\
+\texttt{mention\_rate}       & Agent 1 & Fraction of valid responses with a mention \\
+\texttt{stability\_score}    & Agent 1 & $\text{mention\_rate} \times \frac{1}{1+\text{rank\_variance}}$ \\
+\texttt{consistency\_label}  & Agent 1 & stable / variable / unstable \\
+\texttt{gm\_rating}          & Agent 2 & Google Maps rating (0--5) \\
+\texttt{gm\_review\_count}   & Agent 2 & Google Maps number of reviews \\
+\texttt{ta\_rating}          & Agent 2 & TripAdvisor rating \\
+\texttt{ta\_ranking}         & Agent 2 & TripAdvisor ranking position \\
+\texttt{has\_wikipedia}      & Agent 2 & Boolean Wikipedia presence \\
+\texttt{ig\_followers}       & Agent 2 & Instagram follower count \\
+\texttt{overall\_confidence} & Agent 2 & Agent-assigned data quality score (0--1) \\
+\texttt{data\_completeness}  & Agent 3 & Fraction of key fields non-null (0--1) \\
+\texttt{unified\_quality}    & Agent 3 & complete / partial / sparse / agent2\_failed \\
+\texttt{triage\_decision}    & Agent 3 & retry / hallucination / non\_restaurant / generic (failed entities only) \\
+\texttt{triage\_reason}      & Agent 3 & LLM justification for the triage decision \\
+\hline
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Results}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The pipeline was applied to the Tunisian restaurant domain. Agent~0 generated
+\textbf{30 prompts} covering \textbf{6 distinct user intents} (top recommendation,
+tourist reviews, comparative, authentic cuisine, special occasion, location-based)
+with 5~variants each in French. Agent~1 submitted each prompt to
+\textbf{3 model slots}, repeated 5~times per slot, yielding \textbf{450 total
+responses}. From these, 2{,}020 raw entity extraction records (831 unique surface
+forms) were produced, which the five-phase cleaning pipeline consolidated into
+\textbf{234 canonical entities}.
+
+Of the 234 entities, \textbf{213 met the eligibility threshold} (minimum mention
+rate) and were submitted to Agent~2 for web enrichment. Agent~3 then applied
+LLM-based deduplication to collapse variant spellings of the same establishment
+(e.g., \textit{Dar El Jeld} vs.\ \textit{Dar el Jeld Restaurant}) and
+LLM-based triage to remove non-viable entries: 4~entities were rejected
+(1~hallucination, 1~non-restaurant venue, 2~over-generic names). The final
+dataset contains \textbf{182 enriched entities}. Table~\ref{tab:pipeline_results}
+summarizes the key metrics from the actual output files.
+
+\begin{table}[H]
+\centering
+\caption{Pipeline results on the Tunisian restaurant domain.}
+\label{tab:pipeline_results}
+\begin{tabular}{|p{7cm}|r|}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Prompts generated (Agent 0)                          & 30 \\
+LLM responses collected (Agent 1)                    & 450 \\
+Raw entity extraction records                        & 2{,}020 \\
+Unique surface forms before cleaning                 & 831 \\
+Canonical entities after cleaning                    & 234 \\
+Entities submitted to Agent 2                        & 213 \\
+Final entities after dedup + triage (Agent 3)        & 182 \\
+\quad — Complete ($\geq$3 sources)                   & 75 \\
+\quad — Partial (1--2 sources)                       & 84 \\
+\quad — Failed (no sources recovered)                & 22 \\
+Entities rejected by LLM triage                      & 4 \\
+Google Maps coverage                                 & 85.2\% \\
+TripAdvisor coverage                                 & 38.5\% \\
+Wikipedia presence                                   & 0\% \\
+Instagram presence                                   & 31.9\% \\
+Facebook presence                                    & 28.0\% \\
+Mean data-completeness score                         & 0.584 \\
+Mean overall confidence score                        & 0.541 \\
+\hline
+\end{tabular}
+\end{table}
+
+The distribution of LLM visibility is strongly concentrated: the top 15\% of
+entities (27 out of 182) accumulate 62\% of all 1{,}351 mention instances, while
+the remaining 85\% share the other 38\%. The single most-visible establishment,
+\textit{Dar El Jeld}, received 159 mentions across all prompts and model slots ---
+more than twice the count of the second-ranked entity. All entities carry an
+\textit{unstable} consistency label, which is expected given the limited prompt set
+(30 prompts) and the high variance of mention rates at this scale. The zero
+Wikipedia coverage confirms that none of the 182 entities has a dedicated Wikipedia
+article, consistent with the local and informal character of the Tunisian restaurant
+market. The moderate Instagram and Facebook presence (32\% and 28\% respectively)
+reflects the partial digitalization of small hospitality businesses in Tunisia.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Limitations and Discussion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Despite the agentic design improvements, several limitations were encountered.
+
+\textbf{Partial web enrichment.} Of the 182 final entities, 22 (12\%) remain in a
+\textit{failed} state after one enrichment pass and a second targeted retry pass.
+These are restaurants whose names are either too common (shared with many
+unrelated venues), spelled inconsistently across sources, or genuinely absent from
+indexed web pages. Improving recall for this tail would require more specific
+search strategies, such as incorporating city-level geocoding into the SerpAPI
+query or combining multiple web sources per entity.
+
+\textbf{Geographic disambiguation.} A number of entity names extracted from LLM
+responses refer to well-known establishments outside Tunisia --- for example,
+\textit{Le Grand Véfour} (Paris) or \textit{La Mamounia} (Marrakech hotel) ---
+that are far better represented in LLM training data than any Tunisian homonym.
+Agent~3's LLM triage successfully identified and rejected 4 such non-viable
+entities, but the root cause lies upstream: Agent~0 prompts should more
+aggressively enforce geographic specificity to prevent the LLM from surfacing
+non-Tunisian establishments in the first place.
+
+\textbf{Social media data sparsity.} Only 31.9\% of the 182 entities carry an
+identified Instagram handle and 28.0\% a Facebook page, reflecting the relatively
+low digital formalization of small hospitality businesses in the Tunisian market.
+This sparsity limits the social dimension of the GEO score for the majority of
+entities, and may understate the actual social media presence of establishments
+that operate under informal or unverified page names.
+
+\textbf{Triage robustness and JSON fragility.} The LLM triage step in Agent~3
+serializes entity names into JSON prompts. Entity names containing apostrophes
+(e.g., \textit{la table d'or}) caused JSON parse failures in initial runs,
+requiring a robust fallback parser (\texttt{\_parse\_json\_objects}) that extracts
+individual JSON objects when the full array parse fails. This fragility is an
+inherent risk of relying on LLM-generated structured output and should be
+addressed by escaping entity names before injection or switching to a
+tool-calling interface.
+
+\textbf{Retry convergence.} The two-pass retry design (Agent~2 $\rightarrow$
+Agent~3 triage $\rightarrow$ Agent~2 retry) leaves 21 entities in a pending retry
+queue at the end of the observed execution. A fully converged pipeline would
+require either a third pass or a dedicated loop termination criterion (e.g., no
+improvement after two consecutive retries).
+
+\textbf{API quota and rate-limit constraints.}
+The pipeline relies on three categories of external APIs, each with distinct
+failure modes. \textit{LLM inference APIs} (Groq, OpenRouter, Together AI, Mistral)
+impose per-minute and per-day token quotas on free tiers; hitting these limits
+mid-pipeline caused request timeouts and forced the dynamic model registry to
+cycle through fallback models, sometimes exhausting all available slots before a
+batch completed. \textit{SerpAPI}, used by Agent~2 for Google Maps and TripAdvisor
+lookups, provides only 100 free queries per key; with 213 entities requiring
+multiple search queries each, the five available keys were consumed in a single
+execution pass, leaving a subset of entities without web data until the keys
+reset. \textit{Wikidata and Instagram} imposed no hard quotas but required
+progressive throttling (sleep intervals between requests) to avoid HTTP~429
+responses. Collectively, these constraints forced pipeline execution to be split
+across multiple sessions on different days, introducing a temporal inconsistency in
+the collected data. A production deployment would require paid API tiers or
+self-hosted inference to run the full pipeline in a single uninterrupted pass.
+
+\subsection*{Toward a GEO-Based Recommendation System}
+
+Beyond measurement, the ultimate objective of this project is to build a
+\textbf{recommendation system for brand visibility in generative AI}.
+The pipeline described in this chapter constitutes the data acquisition and
+diagnostic layer: it quantifies, for each restaurant, how visible it currently is
+to LLM-based search engines and how complete its digital footprint is across the
+web. The next step is to exploit this dataset to generate \textit{actionable
+recommendations} --- identifying, for each brand, the specific levers that would
+increase its likelihood of being cited by an AI assistant.
+
+Concretely, a low \texttt{mention\_rate} combined with high \texttt{gm\_review\_count}
+suggests that the brand has real-world credibility but lacks the textual signal
+(structured web mentions, linked data, editorial coverage) that LLMs rely on
+during pre-training. Conversely, a brand with high LLM visibility but low
+TripAdvisor coverage may benefit from consolidating its review presence to
+reinforce consistency across sources. The GEO score synthesizes these dimensions
+into a single prioritization signal, enabling the recommendation engine to rank
+optimization actions by expected impact on generative visibility.
+
+This framing --- measuring current AI visibility, diagnosing its root causes,
+and prescribing targeted improvements --- positions the system as a practical
+tool for restaurant owners and marketers who wish to compete in the emerging
+landscape where AI-generated responses, rather than ranked search results, drive
+consumer discovery.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{Conclusion}
+\addcontentsline{toc}{section}{\textbf{Conclusion}}
+% ─────────────────────────────────────────────────────────────────────────────
+
+This chapter has presented the full design, architecture, and results of the GEO
+measurement pipeline. The four agents --- each with a well-defined input, processing
+workflow, and structured output --- collectively realize the three design principles:
+autonomy through supervisor-based error recovery, registry-driven model selection,
+and LLM-based deduplication and triage; resilience through progressive checkpointing,
+fuzzy entity matching, and a two-pass retry loop; and reproducibility through fixed
+CSV schemas and decoupled outputs. Applied to the Tunisian restaurant domain, the
+pipeline produced a final enriched dataset of \textbf{182 entities} with 85.2\%
+Google Maps coverage and a mean data-completeness of 0.584, confirming both a
+strong concentration of LLM visibility (top 15\% of entities attract 62\% of
+mentions) and the practical challenges of web data acquisition for local businesses.
+These findings provide the analytical dataset from which the research questions
+posed in Chapter~1 will be systematically investigated in the following chapters.

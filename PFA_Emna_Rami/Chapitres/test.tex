@@ -1,0 +1,28 @@
+\begin{table}[h!]
+    \centering
+    \renewcommand{\arraystretch}{1.25} % Adjust the cell height
+    \setlength{\arrayrulewidth}{1pt} % Adjust the border thickness
+    \begin{tabular}{p{0.3\textwidth} p{0.7\textwidth}}    
+    \toprule
+    \textbf{Élément} & \textbf{Description} \\
+    \midrule
+    ID & CU3 \\ \hline
+    Cas d'utilisation & S'authentifier \\ \hline
+    Description brève & L'utilisateur importe des vidéos. \\ \hline
+    Acteur & Utilisateur \\ \hline
+    Précondition & Authentification de l'utilisateur \\ \hline
+    Scénario nominal & 
+        \textbf{1.} L'utilisateur accède à la page d'importation de vidéos de site. \newline
+        \textbf{2.} L'utilisateur clique sur le bouton "importer une vidéo". \newline
+        \textbf{3.} L'utilisateur sélectionne la vidéo qu'il souhaite importer depuis son ordinateur. \newline
+        \textbf{4.} Le système vérifie le format et la validité de la vidéo. \newline
+        \textbf{5.} Le système importe la vidéo. \\ \hline
+    Postcondition & Vidéo importée et affichée dans l'interface \\ \hline
+    Enchaînement alternatif & \textbf{4.1} La vidéo est invalide : \newline 
+        \textbullet{} \textbf{4.1.1} Le système affiche un message d'erreur indiquant le problème. \newline
+        \textbullet{} \textbf{4.1.2} L'utilisateur est redirigé à l'étape 2 du scénario nominal et peut importer une nouvelle vidéo. \\
+    \bottomrule
+    \end{tabular} 
+    \caption{Description textuelle du cas d’utilisation « Importer des vidéos »}
+    \label{tab:t4}
+\end{table}

@@ -31,6 +31,7 @@ from config import (
 
 UNIFIED_PATH = os.path.join(OUTPUT_DIR, "unified_features.csv")
 MERGE_REPORT_PATH = os.path.join(OUTPUT_DIR, "merge_report.json")
+REJECTED_PATH = os.path.join(OUTPUT_DIR, "rejected_entities.csv")
 
 # ── Entity name normalisation ─────────────────────────────────────────────────
 
@@ -348,6 +349,245 @@ def _build_report(df1: pd.DataFrame, df2: pd.DataFrame, unified: pd.DataFrame) -
     }
 
 
+# ── Stop words for content-word matching ─────────────────────────────────────
+
+_STOP_WORDS = frozenset({
+    "le", "la", "les", "l", "de", "du", "des", "d", "el", "al", "et",
+    "un", "une", "au", "aux", "en", "restaurant", "cafe", "dar", "maison",
+    "chez", "brasserie", "bistrot", "the", "a", "an",
+})
+
+
+def _content_words(name: str) -> frozenset:
+    """Extract meaningful (non-stop) words from a normalised entity name."""
+    norm = _normalise(name)
+    tokens = frozenset(re.split(r"[\s'\u2019\-]+", norm)) - _STOP_WORDS - {""}
+    return tokens
+
+
+# ── LLM deduplication ─────────────────────────────────────────────────────────
+
+def llm_deduplicate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Identify and merge duplicate entities (same restaurant, different surface forms).
+
+    Phase 1 — candidate detection : group entities by shared content words.
+    Phase 2 — LLM verification    : ask LLM whether each candidate group is the same place.
+    Phase 3 — merge                : sum mention counts, keep best web data, drop dup rows.
+    """
+    from llm_utils import call_llm
+
+    names = df["canonical_entity"].tolist()
+    content = {n: _content_words(n) for n in names}
+
+    # Build candidate groups (content-word overlap >= 1)
+    assigned: set = set()
+    groups: list = []
+    for i, a in enumerate(names):
+        if a in assigned or not content[a]:
+            continue
+        group = [a]
+        for b in names[i + 1:]:
+            if b in assigned:
+                continue
+            if content[a] & content[b]:
+                group.append(b)
+        if len(group) > 1:
+            assigned.update(group)
+            groups.append(group)
+
+    if not groups:
+        print("  LLM dedup     : no candidate groups found")
+        return df
+
+    print(f"  LLM dedup     : {len(groups)} candidate groups → asking LLM")
+
+    prompt = (
+        "You are deduplicating a Tunisian restaurant dataset.\n\n"
+        "For each group of names below, decide if ALL names refer to the SAME physical restaurant.\n\n"
+        "Groups:\n"
+        + json.dumps(groups, ensure_ascii=False, indent=2)
+        + "\n\nRules:\n"
+        "- Article/prefix differences only (\"le café des nattes\" vs \"café des nattes\") → same place\n"
+        "- Different final word (\"dar el jeld\" vs \"dar el jaziri\") → different places\n"
+        "- Short form vs full form (\"el mouradi\" vs \"restaurant el mouradi\") → same place\n"
+        "- City suffix variant (\"el mouradi\" vs \"el mouradi sousse\") → same place\n\n"
+        "Respond ONLY with a JSON array:\n"
+        "[\n"
+        "  {\"group\": [\"name1\", \"name2\"], \"same_place\": true, "
+        "\"keep\": \"most complete name to keep as canonical\"}\n"
+        "]"
+    )
+
+    try:
+        response = call_llm(prompt=prompt, max_completion_tokens=2048)
+        m = re.search(r'\[.*\]', response, re.DOTALL)
+        if not m:
+            print("  LLM dedup     : parse failed — skipping")
+            return df
+        decisions = json.loads(m.group())
+    except Exception as e:
+        print(f"  LLM dedup     : error ({e}) — skipping")
+        return df
+
+    # Build merge map: dup_name → keep_name
+    merge_map: dict = {}
+    for d in decisions:
+        if not d.get("same_place"):
+            continue
+        keep = d.get("keep", "")
+        group = d.get("group", [])
+        if keep not in names:
+            keep = group[0] if group else ""
+        for name in group:
+            if name != keep and name in names:
+                merge_map[name] = keep
+
+    if not merge_map:
+        print("  LLM dedup     : no merges needed")
+        return df
+
+    # Apply merges: sum mention_count, fill nulls from duplicate row
+    df = df.copy()
+    for dup_name, keep_name in merge_map.items():
+        dup_idxs  = df.index[df["canonical_entity"] == dup_name].tolist()
+        keep_idxs = df.index[df["canonical_entity"] == keep_name].tolist()
+        if not dup_idxs or not keep_idxs:
+            continue
+        di, ki = dup_idxs[0], keep_idxs[0]
+
+        # Sum mention count
+        df.at[ki, "mention_count"] = (
+            (df.at[ki, "mention_count"] or 0) + (df.at[di, "mention_count"] or 0)
+        )
+
+        # Fill missing fields in keep row from duplicate row
+        for col in df.columns:
+            if col in ("canonical_entity", "mention_count"):
+                continue
+            kv, dv = df.at[ki, col], df.at[di, col]
+            if (pd.isna(kv) or kv == "" or kv == 0) and not (pd.isna(dv) or dv == "" or dv == 0):
+                df.at[ki, col] = dv
+
+    df = df[~df["canonical_entity"].isin(merge_map)].reset_index(drop=True)
+    print(f"  LLM dedup     : merged {len(merge_map)} duplicates → {len(df)} entities remain")
+    return df
+
+
+# ── Robust JSON object extractor ─────────────────────────────────────────────
+
+def _parse_json_objects(text: str) -> list:
+    """
+    Extract as many valid JSON objects as possible from an LLM response.
+    Handles truncated arrays and malformed entries by parsing object-by-object
+    instead of the whole array at once — apostrophes in entity names won't
+    break the entire batch.
+    """
+    # First try the whole array
+    m = re.search(r'\[.*\]', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Fall back: extract individual {...} objects and parse each separately
+    results = []
+    for obj_match in re.finditer(r'\{[^{}]+\}', text, re.DOTALL):
+        try:
+            results.append(json.loads(obj_match.group()))
+        except json.JSONDecodeError:
+            # Try fixing common issues: unescaped apostrophes inside string values
+            fixed = re.sub(r"(?<=\w)'(?=\w)", r"\\'", obj_match.group())
+            try:
+                results.append(json.loads(fixed))
+            except json.JSONDecodeError:
+                continue
+    return results
+
+
+# ── LLM triage of failed entities ─────────────────────────────────────────────
+
+def llm_triage_failed(df: pd.DataFrame) -> tuple:
+    """
+    Classify agent2_failed entities and remove non-viable ones from the output.
+
+    Classifications:
+      retry         — likely a real Tunisian restaurant, Agent 2 missed it
+      hallucination — LLM invented the name (e.g. a foreign or fictional restaurant)
+      non_restaurant— real place but not a restaurant (hotel, city, souk, etc.)
+      generic       — name too vague to ever identify uniquely
+
+    Returns (cleaned_df, retry_list).
+    Removed entities are saved to rejected_entities.csv for audit.
+    """
+    from llm_utils import call_llm
+    from collections import Counter
+
+    failed = df[df["unified_quality"] == "agent2_failed"].copy()
+    if failed.empty:
+        return df, []
+
+    entities = (
+        failed[["canonical_entity", "mention_count", "stability_score"]]
+        .to_dict(orient="records")
+    )
+
+    prompt = (
+        "You are auditing a Tunisian restaurant dataset.\n\n"
+        "The following entities were extracted by LLMs but could NOT be verified online.\n"
+        "Classify each as one of:\n"
+        "- \"retry\"          : very likely a real Tunisian restaurant — Agent 2 missed it, worth retrying\n"
+        "- \"hallucination\"  : LLM invented this name (e.g. foreign restaurant, fictional place)\n"
+        "- \"non_restaurant\" : real place but not a restaurant (hotel chain, city landmark, souk, etc.)\n"
+        "- \"generic\"        : name too vague to identify uniquely (\"le grand restaurant\", \"la villa\")\n\n"
+        "Context: domain is Tunisian restaurants. Higher mention_count = more LLMs named it.\n\n"
+        "Entities:\n"
+        + json.dumps(entities, ensure_ascii=False, indent=2)
+        + "\n\nRespond ONLY with a JSON array:\n"
+        "[\n"
+        "  {\"entity\": \"exact name\", \"decision\": \"retry|hallucination|non_restaurant|generic\","
+        " \"reason\": \"one sentence\"}\n"
+        "]"
+    )
+
+    try:
+        response = call_llm(prompt=prompt, max_completion_tokens=3000)
+        decisions = _parse_json_objects(response)
+        if not decisions:
+            print("  LLM triage    : parse failed — skipping")
+            return df, []
+    except Exception as e:
+        print(f"  LLM triage    : error ({e}) — skipping")
+        return df, []
+
+    decision_map = {d["entity"]: d["decision"] for d in decisions}
+    reason_map   = {d["entity"]: d.get("reason", "") for d in decisions}
+
+    counts = Counter(decision_map.values())
+    print(f"  LLM triage    : {dict(counts)}")
+
+    retry_list = [name for name, dec in decision_map.items() if dec == "retry"]
+
+    # Tag triaged entities
+    df = df.copy()
+    df["triage_decision"] = df["canonical_entity"].map(decision_map)
+    df["triage_reason"]   = df["canonical_entity"].map(reason_map)
+
+    # Save rejected entities to audit file, then remove from main output
+    remove_set = {name for name, dec in decision_map.items()
+                  if dec in ("hallucination", "non_restaurant", "generic")}
+    rejected = df[df["canonical_entity"].isin(remove_set)].copy()
+    if not rejected.empty:
+        rejected.to_csv(REJECTED_PATH, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
+        print(f"  Rejected      : {len(rejected)} entities → {REJECTED_PATH}")
+
+    df = df[~df["canonical_entity"].isin(remove_set)].reset_index(drop=True)
+    print(f"  After triage  : {len(df)} entities remain  ({len(retry_list)} queued for retry)")
+
+    return df, retry_list
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run_agent3_merge(
@@ -383,11 +623,16 @@ def run_agent3_merge(
 
     unified = merge_features(df1, df2)
 
+    # ── LLM post-processing ───────────────────────────────────────────────────
+    unified = llm_deduplicate(unified)
+    unified, retry_list = llm_triage_failed(unified)
+
     # Save
     unified.to_csv(output_path, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_ALL)
     print(f"  Saved unified   : {output_path}  ({len(unified)} rows)")
 
     report = _build_report(df1, df2, unified)
+    report["retry_entities"] = retry_list
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     print(f"  Saved report    : {report_path}")
@@ -402,6 +647,8 @@ def run_agent3_merge(
     print(f"    TripAdvisor   : {report['ta_coverage_pct']}%")
     print(f"    Wikipedia     : {report['wikipedia_coverage_pct']}%")
     print(f"    Avg completeness: {report['avg_data_completeness']}")
+    if retry_list:
+        print(f"\n  Retry queue ({len(retry_list)}): {retry_list[:5]}{'...' if len(retry_list) > 5 else ''}")
     print(f"{'='*55}")
 
     return report
@@ -424,7 +671,8 @@ def run_agent3_node(state: PipelineState) -> PipelineState:
 
     return {
         **state,
-        "merge_report":   report,
-        "current_step":   "agent3_done",
-        "errors":         errors,
+        "merge_report":    report,
+        "retry_entities":  report.get("retry_entities", []),
+        "current_step":    "agent3_done",
+        "errors":          errors,
     }
